@@ -1,0 +1,5 @@
+node_modules/
+.next/
+zeroday.db
+*.db-shm
+*.db-wal
