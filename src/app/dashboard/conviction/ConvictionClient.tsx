@@ -1,10 +1,46 @@
 'use client'
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import ThemeToggle from '@/components/ThemeToggle'
 import type { StockState, Position, CapitalData } from '@/lib/stockState'
 
 type StockEntry = StockState & { name: string }
+
+const NIFTY50_SET = new Set([
+  'ADANIPORTS','APOLLOHOSP','ASIANPAINT','AXISBANK','BAJAJ-AUTO',
+  'BAJAJFINSV','BAJFINANCE','BEL','BHARTIARTL','BPCL',
+  'BRITANNIA','CIPLA','COALINDIA','DRREDDY','EICHERMOT',
+  'ETERNAL','GRASIM','HCLTECH','HDFCBANK','HDFCLIFE',
+  'HEROMOTOCO','HINDALCO','HINDUNILVR','ICICIBANK','INDUSINDBK',
+  'INFY','ITC','JIOFIN','JSWSTEEL','KOTAKBANK',
+  'LT','M&M','MARUTI','NESTLEIND','NTPC',
+  'ONGC','POWERGRID','RELIANCE','SBILIFE','SBIN',
+  'SHRIRAMFIN','SUNPHARMA','TATACONSUM','TATASTEEL','TCS',
+  'TECHM','TITAN','TRENT','ULTRACEMCO','WIPRO',
+])
+
+interface N50Prediction {
+  predictedMove: number
+  bullProb: number
+  bearProb: number
+  topSim: number
+  confidence: number
+  nResolved: number
+  direction: 'BULL' | 'BEAR' | null
+  status: 'ready' | 'warming' | 'no_data'
+}
+
+interface N50State {
+  prediction: N50Prediction
+  snapshotCount: number
+  patternCount: number
+  resolvedCount: number
+  niftyProxy: number
+  bullStockPct: number
+  bearStockPct: number
+  coverageCount: number
+  minutesAccumulated: number
+}
 
 interface ConvictionResult {
   score: number
@@ -390,6 +426,105 @@ function Pill({ label, value, color }: { label: string; value: string; color: st
   )
 }
 
+// ── N50 Prediction Panel ───────────────────────────────────────────────────
+
+function N50PredictionPanel({ n50 }: { n50: N50State | null }) {
+  if (!n50) return (
+    <div style={{ padding: '16px', background: 'var(--bg2)', borderRadius: '8px', border: '1px solid var(--border)', textAlign: 'center' }}>
+      <span style={{ fontSize: '11px', color: 'var(--text3)' }}>Loading NIFTY 50 model...</span>
+    </div>
+  )
+
+  const pred = n50.prediction
+  const bullPct = Math.round(pred.bullProb * 100)
+  const bearPct = Math.round(pred.bearProb * 100)
+  const dirColor = pred.direction === 'BULL' ? 'var(--bull)' : pred.direction === 'BEAR' ? 'var(--bear)' : 'var(--text3)'
+  const proxySign = n50.niftyProxy >= 0 ? '+' : ''
+
+  return (
+    <div style={{
+      padding: '16px', background: 'var(--bg2)', borderRadius: '8px',
+      border: `1px solid ${pred.status === 'ready' && pred.direction ? dirColor : 'var(--border)'}`,
+      display: 'flex', flexDirection: 'column', gap: '12px',
+    }}>
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px' }}>
+          <span style={{ fontSize: '13px', fontWeight: 700, letterSpacing: '-0.02em', color: 'var(--text)' }}>patN50-60-20</span>
+          <span style={{ fontSize: '10px', color: 'var(--text3)' }}>QKV Attention · 60m query → 20m prediction</span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '10px', color: 'var(--text3)' }}>{n50.coverageCount}/50 stocks</span>
+          <span style={{ fontSize: '10px', color: 'var(--text3)' }}>{n50.minutesAccumulated}m accumulated</span>
+        </div>
+      </div>
+
+      {pred.status === 'no_data' ? (
+        <div style={{ fontSize: '11px', color: 'var(--text3)', padding: '8px 0' }}>
+          Accumulating conviction snapshots... Predictions start after ~20 min of market data.
+          <br /><span style={{ fontSize: '10px' }}>Snapshots: {n50.snapshotCount} | Patterns: {n50.patternCount} | Resolved: {n50.resolvedCount}</span>
+        </div>
+      ) : pred.status === 'warming' ? (
+        <div style={{ fontSize: '11px', color: 'var(--mixed)', padding: '8px 0' }}>
+          Warming up — {n50.resolvedCount}/10 resolved patterns (need 10 minimum).
+          <br /><span style={{ fontSize: '10px', color: 'var(--text3)' }}>Snapshots: {n50.snapshotCount} | {n50.minutesAccumulated}m of data</span>
+        </div>
+      ) : (
+        <>
+          {/* Prediction row */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
+            {/* Direction + predicted move */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              {pred.direction && (
+                <span style={{
+                  fontSize: '14px', fontWeight: 700, color: dirColor,
+                  padding: '3px 10px', borderRadius: '4px',
+                  background: pred.direction === 'BULL' ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)',
+                }}>
+                  {pred.direction === 'BULL' ? '▲' : '▼'} {pred.direction}
+                </span>
+              )}
+              <span style={{ fontSize: '16px', fontWeight: 700, color: pred.predictedMove >= 0 ? 'var(--bull)' : 'var(--bear)' }}>
+                {pred.predictedMove >= 0 ? '+' : ''}{pred.predictedMove.toFixed(3)}%
+              </span>
+            </div>
+
+            {/* Bull/Bear probability bar */}
+            <div style={{ flex: 1, minWidth: '120px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <span style={{ fontSize: '10px', fontWeight: 600, color: 'var(--bull)', width: '30px', textAlign: 'right' }}>{bullPct}%</span>
+              <div style={{ flex: 1, height: '6px', background: 'var(--bg3)', borderRadius: '3px', overflow: 'hidden', display: 'flex' }}>
+                <div style={{ width: `${bullPct}%`, height: '100%', background: 'var(--bull)', borderRadius: '3px 0 0 3px' }} />
+                <div style={{ width: `${bearPct}%`, height: '100%', background: 'var(--bear)', borderRadius: '0 3px 3px 0' }} />
+              </div>
+              <span style={{ fontSize: '10px', fontWeight: 600, color: 'var(--bear)', width: '30px' }}>{bearPct}%</span>
+            </div>
+          </div>
+
+          {/* Model stats */}
+          <div style={{ display: 'flex', gap: '16px', fontSize: '10px', flexWrap: 'wrap', color: 'var(--text3)' }}>
+            <span>sim: <span style={{ color: 'var(--text2)', fontWeight: 600 }}>{pred.topSim.toFixed(3)}</span></span>
+            <span>conf: <span style={{ color: 'var(--text2)', fontWeight: 600 }}>{(pred.confidence * 100).toFixed(0)}%</span></span>
+            <span>n: <span style={{ color: 'var(--text2)', fontWeight: 600 }}>{pred.nResolved}</span></span>
+            <span>proxy: <span style={{ color: n50.niftyProxy >= 0 ? 'var(--bull)' : 'var(--bear)', fontWeight: 600 }}>{proxySign}{n50.niftyProxy.toFixed(3)}%</span></span>
+          </div>
+        </>
+      )}
+
+      {/* Breadth bar */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <span style={{ fontSize: '9px', color: 'var(--text3)', letterSpacing: '0.05em', width: '50px', flexShrink: 0 }}>BREADTH</span>
+        <div style={{ flex: 1, height: '4px', background: 'var(--bg3)', borderRadius: '2px', overflow: 'hidden', display: 'flex' }}>
+          <div style={{ width: `${n50.bullStockPct}%`, height: '100%', background: 'var(--bull)' }} />
+          <div style={{ width: `${100 - n50.bullStockPct - n50.bearStockPct}%`, height: '100%', background: 'var(--bg3)' }} />
+          <div style={{ width: `${n50.bearStockPct}%`, height: '100%', background: 'var(--bear)' }} />
+        </div>
+        <span style={{ fontSize: '10px', color: 'var(--bull)', fontWeight: 600, width: '28px', textAlign: 'right' }}>{n50.bullStockPct}%</span>
+        <span style={{ fontSize: '10px', color: 'var(--bear)', fontWeight: 600, width: '28px' }}>{n50.bearStockPct}%</span>
+      </div>
+    </div>
+  )
+}
+
 // ── Styles ───────────────────────────────────────────────────────────────────
 
 const btnStyle: React.CSSProperties = {
@@ -408,8 +543,23 @@ export default function ConvictionClient() {
   const [positions, setPositions] = useState<Position[]>([])
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
   const [status, setStatus] = useState<'connecting' | 'live' | 'stale'>('connecting')
-  const [filter, setFilter] = useState<'all' | 'strong' | 'partial' | 'positions'>('all')
+  const [filter, setFilter] = useState<'all' | 'strong' | 'partial' | 'positions' | 'nifty50'>('all')
+  const [n50, setN50] = useState<N50State | null>(null)
   const esRef = useRef<EventSource | null>(null)
+
+  // Poll N50 predictions when in nifty50 mode
+  useEffect(() => {
+    if (filter !== 'nifty50') return
+    let cancelled = false
+    const poll = () => {
+      fetch('/api/nifty50').then(r => r.json()).then(data => {
+        if (!cancelled) setN50(data)
+      }).catch(() => {})
+    }
+    poll()
+    const iv = setInterval(poll, 10_000)
+    return () => { cancelled = true; clearInterval(iv); setN50(null) }
+  }, [filter])
 
   useEffect(() => {
     function connect() {
@@ -441,6 +591,7 @@ export default function ConvictionClient() {
   convictions.sort((a, b) => b.conviction.score - a.conviction.score)
 
   const filtered = convictions.filter(({ stock, conviction }) => {
+    if (filter === 'nifty50') return NIFTY50_SET.has(stock.name)
     if (filter === 'strong') return conviction.score >= 0.7
     if (filter === 'partial') return conviction.score >= 0.45
     if (filter === 'positions') return positions.some(p => p.stock === stock.name)
@@ -493,21 +644,30 @@ export default function ConvictionClient() {
           </span>
           <span style={{ fontSize: '10px', color: 'var(--text3)' }}>
             {filtered.length} stocks · {convictions.filter(c => c.conviction.score >= 0.7).length} strong
+            {filter === 'nifty50' && n50 ? ` · ${n50.coverageCount}/50 covered` : ''}
           </span>
         </div>
         <div style={{ display: 'flex', gap: '4px' }}>
-          {(['all', 'strong', 'partial', 'positions'] as const).map(f => (
+          {(['all', 'nifty50', 'strong', 'partial', 'positions'] as const).map(f => (
             <button key={f} onClick={() => setFilter(f)} style={{
               ...btnStyle, padding: '3px 10px', fontSize: '10px',
-              background: filter === f ? 'var(--accent)' : 'transparent',
-              color: filter === f ? 'var(--bg)' : 'var(--text3)',
-              border: filter === f ? 'none' : '1px solid var(--border)',
+              background: filter === f ? (f === 'nifty50' ? 'var(--mixed)' : 'var(--accent)') : 'transparent',
+              color: filter === f ? 'var(--bg)' : f === 'nifty50' ? 'var(--mixed)' : 'var(--text3)',
+              border: filter === f ? 'none' : `1px solid ${f === 'nifty50' ? 'var(--mixed)' : 'var(--border)'}`,
+              fontWeight: f === 'nifty50' ? 700 : undefined,
             }}>
-              {f === 'all' ? 'ALL' : f === 'strong' ? 'STRONG' : f === 'partial' ? '≥ PARTIAL' : 'POSITIONS'}
+              {f === 'all' ? 'ALL' : f === 'nifty50' ? 'NIFTY 50' : f === 'strong' ? 'STRONG' : f === 'partial' ? '≥ PARTIAL' : 'POSITIONS'}
             </button>
           ))}
         </div>
       </div>
+
+      {/* N50 prediction panel */}
+      {filter === 'nifty50' && (
+        <div style={{ padding: '12px 16px 0' }}>
+          <N50PredictionPanel n50={n50} />
+        </div>
+      )}
 
       {/* Positions pinned at top */}
       {posConvictions.length > 0 && filter !== 'positions' && (
