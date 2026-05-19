@@ -2,20 +2,21 @@ import fs from 'fs'
 import path from 'path'
 import type { StockState, StockStateFile } from './stockState'
 import { readStockState } from './stockState'
+import { getISTDateStr, getISTHourMin, getNextTradingDay } from './tradingCalendar'
 
 // ── NIFTY 50 Constituents (May 2026) ───────────────────────────────────────
 
 export const NIFTY50_STOCKS = [
-  'ADANIPORTS','APOLLOHOSP','ASIANPAINT','AXISBANK','BAJAJ-AUTO',
-  'BAJAJFINSV','BAJFINANCE','BEL','BHARTIARTL','BPCL',
-  'BRITANNIA','CIPLA','COALINDIA','DRREDDY','EICHERMOT',
-  'ETERNAL','GRASIM','HCLTECH','HDFCBANK','HDFCLIFE',
-  'HEROMOTOCO','HINDALCO','HINDUNILVR','ICICIBANK','INDUSINDBK',
-  'INFY','ITC','JIOFIN','JSWSTEEL','KOTAKBANK',
-  'LT','M&M','MARUTI','NESTLEIND','NTPC',
-  'ONGC','POWERGRID','RELIANCE','SBILIFE','SBIN',
-  'SHRIRAMFIN','SUNPHARMA','TATACONSUM','TATASTEEL','TCS',
-  'TECHM','TITAN','TRENT','ULTRACEMCO','WIPRO',
+  'ADANIENT','ADANIPORTS','APOLLOHOSP','ASIANPAINT','AXISBANK',
+  'BAJAJ-AUTO','BAJAJFINSV','BAJFINANCE','BEL','BHARTIARTL',
+  'CIPLA','COALINDIA','DRREDDY','EICHERMOT','ETERNAL',
+  'GRASIM','HCLTECH','HDFCBANK','HDFCLIFE','HINDALCO',
+  'HINDUNILVR','ICICIBANK','INDIGO','INFY','ITC',
+  'JIOFIN','JSWSTEEL','KOTAKBANK','LT','M&M',
+  'MARUTI','MAXHEALTH','NESTLEIND','NTPC','ONGC',
+  'POWERGRID','RELIANCE','SBILIFE','SBIN','SHRIRAMFIN',
+  'SUNPHARMA','TATACONSUM','TATASTEEL','TCS','TECHM',
+  'TITAN','TMPV','TRENT','ULTRACEMCO','WIPRO',
 ] as const
 
 const FEATURES_PER_STOCK = 6
@@ -80,6 +81,40 @@ export interface N50State {
   bearStockPct: number
   coverageCount: number
   minutesAccumulated: number
+  dayPrediction?: DayPredictionState
+}
+
+// ── Day-Ahead Prediction Types ────────────────────────────────────────────
+
+export interface DayPrediction {
+  predictedMove: number
+  bullProb: number
+  bearProb: number
+  topSim: number
+  confidence: number
+  nResolved: number
+  direction: 'BULL' | 'BEAR' | null
+  status: 'ready' | 'warming' | 'no_data'
+  captureDay: string
+  targetDay: string
+}
+
+export interface DayResolutionLog {
+  captureDay: string
+  targetDay: string
+  predictedMove: number
+  predictedDirection: 'BULL' | 'BEAR' | null
+  actualProxy20: number
+  correct: boolean
+  error: number
+  resolvedAt: number
+}
+
+export interface DayPredictionState {
+  prediction: DayPrediction | null
+  recentLog: DayResolutionLog[]
+  patternCount: number
+  resolvedCount: number
 }
 
 // ── Singleton Store ────────────────────────────────────────────────────────
@@ -94,6 +129,43 @@ let store: Store = {
 }
 
 let loaded = false
+
+// ── Day-Ahead Store ───────────────────────────────────────────────────────
+
+const DAY_PATTERN_FILE = path.join('/workspace/option-trader', 'nifty50-day-patterns.json')
+const DAY_CAPTURE_HOUR = 15
+const DAY_CAPTURE_MINUTE = 0
+const DAY_RESOLVE_HOUR = 9
+const DAY_RESOLVE_MINUTE = 35
+const DAY_KNN_K = 15
+const DAY_MIN_PATTERNS = 5
+const DAY_TEMPERATURE = 0.5
+const MAX_DAY_PATTERNS = 500
+
+interface DayClosingPattern {
+  captureDay: string
+  captureTs: number
+  vec: number[]
+  niftyProxy: number
+  targetDay: string
+  outcomeProxy: number | null
+  dim: number
+}
+
+interface DayStore {
+  patterns: DayClosingPattern[]
+  latestPrediction: DayPrediction | null
+  resolutionLog: DayResolutionLog[]
+  savedAt: number
+}
+
+let dayStore: DayStore = {
+  patterns: [],
+  latestPrediction: null,
+  resolutionLog: [],
+  savedAt: 0,
+}
+let dayStoreLoaded = false
 
 function ensureLoaded() {
   if (loaded) return
@@ -293,6 +365,134 @@ function resolveOutcomes() {
   }
 }
 
+// ── Day-Ahead Prediction Logic ─────────────────────────────────────────────
+
+function ensureDayStoreLoaded() {
+  if (dayStoreLoaded) return
+  dayStoreLoaded = true
+  try {
+    const raw = fs.readFileSync(DAY_PATTERN_FILE, 'utf8')
+    const saved = JSON.parse(raw) as Partial<DayStore>
+    if (Array.isArray(saved.patterns)) dayStore.patterns = saved.patterns.slice(-MAX_DAY_PATTERNS)
+    if (saved.latestPrediction) dayStore.latestPrediction = saved.latestPrediction
+    if (Array.isArray(saved.resolutionLog)) dayStore.resolutionLog = saved.resolutionLog
+  } catch { /* no file yet */ }
+}
+
+function persistDayStore() {
+  try {
+    fs.writeFileSync(DAY_PATTERN_FILE, JSON.stringify({
+      patterns: dayStore.patterns.slice(-MAX_DAY_PATTERNS),
+      latestPrediction: dayStore.latestPrediction,
+      resolutionLog: dayStore.resolutionLog,
+      savedAt: Date.now(),
+    }))
+  } catch { /* ignore */ }
+}
+
+function queryDayAttention(queryVec: number[]): DayPrediction {
+  const resolved = dayStore.patterns.filter(p => p.outcomeProxy !== null && p.dim === VEC_DIM)
+
+  if (resolved.length < DAY_MIN_PATTERNS) {
+    return {
+      predictedMove: 0, bullProb: 0.5, bearProb: 0.5,
+      topSim: 0, confidence: 0, nResolved: resolved.length,
+      direction: null, status: resolved.length === 0 ? 'no_data' : 'warming',
+      captureDay: '', targetDay: '',
+    }
+  }
+
+  const sims = resolved.map(p => cosineSim(queryVec, p.vec))
+  const indexed = sims.map((sim, i) => ({ sim, i }))
+  indexed.sort((a, b) => b.sim - a.sim)
+  const topK = indexed.slice(0, Math.min(DAY_KNN_K, resolved.length))
+
+  const maxSim = topK[0].sim
+  const expScores = topK.map(t => Math.exp((t.sim - maxSim) / DAY_TEMPERATURE))
+  const sumExp = expScores.reduce((a, b) => a + b, 0)
+  const weights = expScores.map(e => e / sumExp)
+
+  let predictedMove = 0
+  let bullWeight = 0, bearWeight = 0
+  for (let i = 0; i < topK.length; i++) {
+    const outcome = resolved[topK[i].i].outcomeProxy!
+    predictedMove += weights[i] * outcome
+    if (outcome > 0) bullWeight += weights[i]
+    else if (outcome < 0) bearWeight += weights[i]
+  }
+
+  const total = bullWeight + bearWeight
+  const bullProb = total > 0 ? bullWeight / total : 0.5
+  const bearProb = 1 - bullProb
+
+  return {
+    predictedMove, bullProb, bearProb,
+    topSim: topK[0].sim, confidence: weights[0], nResolved: resolved.length,
+    direction: bullProb >= 0.55 ? 'BULL' : bearProb >= 0.55 ? 'BEAR' : null,
+    status: 'ready',
+    captureDay: '', targetDay: '',
+  }
+}
+
+function captureClosingSnapshot(queryVec: number[], proxy: number, currentDay: string) {
+  const targetDay = getNextTradingDay(currentDay)
+
+  dayStore.patterns.push({
+    captureDay: currentDay, captureTs: Date.now(),
+    vec: queryVec, niftyProxy: proxy,
+    targetDay, outcomeProxy: null, dim: VEC_DIM,
+  })
+  if (dayStore.patterns.length > MAX_DAY_PATTERNS) {
+    dayStore.patterns = dayStore.patterns.slice(-MAX_DAY_PATTERNS)
+  }
+
+  const pred = queryDayAttention(queryVec)
+  dayStore.latestPrediction = {
+    ...pred, captureDay: currentDay, targetDay,
+  }
+  persistDayStore()
+}
+
+function resolveYesterdayPrediction(proxy: number, currentDay: string) {
+  const pending = dayStore.patterns.find(
+    p => p.targetDay === currentDay && p.outcomeProxy === null
+  )
+  if (!pending) return
+
+  pending.outcomeProxy = proxy
+
+  if (dayStore.latestPrediction && dayStore.latestPrediction.targetDay === currentDay) {
+    const pred = dayStore.latestPrediction
+    const actualDir = proxy > 0 ? 'BULL' : proxy < 0 ? 'BEAR' : null
+    const correct = pred.direction !== null && pred.direction === actualDir
+
+    dayStore.resolutionLog.push({
+      captureDay: pending.captureDay,
+      targetDay: currentDay,
+      predictedMove: pred.predictedMove,
+      predictedDirection: pred.direction,
+      actualProxy20: proxy,
+      correct,
+      error: Math.abs(pred.predictedMove - proxy),
+      resolvedAt: Date.now(),
+    })
+
+    if (dayStore.resolutionLog.length > 100) {
+      dayStore.resolutionLog = dayStore.resolutionLog.slice(-100)
+    }
+  }
+  persistDayStore()
+}
+
+function getDayPredictionState(): DayPredictionState {
+  return {
+    prediction: dayStore.latestPrediction,
+    recentLog: dayStore.resolutionLog.slice(-20),
+    patternCount: dayStore.patterns.length,
+    resolvedCount: dayStore.patterns.filter(p => p.outcomeProxy !== null).length,
+  }
+}
+
 // ── Main Entry Point ───────────────────────────────────────────────────────
 
 export function getN50State(): N50State {
@@ -376,6 +576,26 @@ export function getN50State(): N50State {
     ? Math.round((store.snapshots[store.snapshots.length - 1].ts - store.snapshots[0].ts) / 60_000)
     : 0
 
+  // ── Day-ahead prediction ────────────────────────────────────────────────
+  ensureDayStoreLoaded()
+  const wallClock = Date.now()
+  const ist = getISTHourMin(wallClock)
+
+  const closingCapturedToday = dayStore.patterns.some(p => p.captureDay === currentDay)
+
+  const resolvedToday = dayStore.resolutionLog.some(
+    r => r.targetDay === currentDay
+  ) || !dayStore.patterns.some(p => p.targetDay === currentDay && p.outcomeProxy === null)
+
+  if (!resolvedToday && (ist.hour > DAY_RESOLVE_HOUR || (ist.hour === DAY_RESOLVE_HOUR && ist.minute >= DAY_RESOLVE_MINUTE))) {
+    resolveYesterdayPrediction(proxy, currentDay)
+  }
+
+  if (!closingCapturedToday && queryVec && count >= 10
+      && (ist.hour > DAY_CAPTURE_HOUR || (ist.hour === DAY_CAPTURE_HOUR && ist.minute >= DAY_CAPTURE_MINUTE))) {
+    captureClosingSnapshot(queryVec, proxy, currentDay)
+  }
+
   return {
     prediction,
     snapshotCount: store.snapshots.length,
@@ -386,6 +606,7 @@ export function getN50State(): N50State {
     bearStockPct: totalStocks > 0 ? Math.round((bearStocks / totalStocks) * 100) : 0,
     coverageCount: count,
     minutesAccumulated,
+    dayPrediction: getDayPredictionState(),
   }
 }
 
@@ -394,6 +615,7 @@ export function persistN50() {
 }
 
 function emptyState(): N50State {
+  ensureDayStoreLoaded()
   return {
     prediction: {
       predictedMove: 0, bullProb: 0.5, bearProb: 0.5,
@@ -403,5 +625,6 @@ function emptyState(): N50State {
     snapshotCount: 0, patternCount: 0, resolvedCount: 0,
     niftyProxy: 0, bullStockPct: 0, bearStockPct: 0,
     coverageCount: 0, minutesAccumulated: 0,
+    dayPrediction: getDayPredictionState(),
   }
 }

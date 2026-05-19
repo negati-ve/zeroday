@@ -7,16 +7,16 @@ import type { StockState, Position, CapitalData } from '@/lib/stockState'
 type StockEntry = StockState & { name: string }
 
 const NIFTY50_SET = new Set([
-  'ADANIPORTS','APOLLOHOSP','ASIANPAINT','AXISBANK','BAJAJ-AUTO',
-  'BAJAJFINSV','BAJFINANCE','BEL','BHARTIARTL','BPCL',
-  'BRITANNIA','CIPLA','COALINDIA','DRREDDY','EICHERMOT',
-  'ETERNAL','GRASIM','HCLTECH','HDFCBANK','HDFCLIFE',
-  'HEROMOTOCO','HINDALCO','HINDUNILVR','ICICIBANK','INDUSINDBK',
-  'INFY','ITC','JIOFIN','JSWSTEEL','KOTAKBANK',
-  'LT','M&M','MARUTI','NESTLEIND','NTPC',
-  'ONGC','POWERGRID','RELIANCE','SBILIFE','SBIN',
-  'SHRIRAMFIN','SUNPHARMA','TATACONSUM','TATASTEEL','TCS',
-  'TECHM','TITAN','TRENT','ULTRACEMCO','WIPRO',
+  'ADANIENT','ADANIPORTS','APOLLOHOSP','ASIANPAINT','AXISBANK',
+  'BAJAJ-AUTO','BAJAJFINSV','BAJFINANCE','BEL','BHARTIARTL',
+  'CIPLA','COALINDIA','DRREDDY','EICHERMOT','ETERNAL',
+  'GRASIM','HCLTECH','HDFCBANK','HDFCLIFE','HINDALCO',
+  'HINDUNILVR','ICICIBANK','INDIGO','INFY','ITC',
+  'JIOFIN','JSWSTEEL','KOTAKBANK','LT','M&M',
+  'MARUTI','MAXHEALTH','NESTLEIND','NTPC','ONGC',
+  'POWERGRID','RELIANCE','SBILIFE','SBIN','SHRIRAMFIN',
+  'SUNPHARMA','TATACONSUM','TATASTEEL','TCS','TECHM',
+  'TITAN','TMPV','TRENT','ULTRACEMCO','WIPRO',
 ])
 
 interface N50Prediction {
@@ -30,6 +30,37 @@ interface N50Prediction {
   status: 'ready' | 'warming' | 'no_data'
 }
 
+interface DayPrediction {
+  predictedMove: number
+  bullProb: number
+  bearProb: number
+  topSim: number
+  confidence: number
+  nResolved: number
+  direction: 'BULL' | 'BEAR' | null
+  status: 'ready' | 'warming' | 'no_data'
+  captureDay: string
+  targetDay: string
+}
+
+interface DayResolutionLog {
+  captureDay: string
+  targetDay: string
+  predictedMove: number
+  predictedDirection: 'BULL' | 'BEAR' | null
+  actualProxy20: number
+  correct: boolean
+  error: number
+  resolvedAt: number
+}
+
+interface DayPredictionState {
+  prediction: DayPrediction | null
+  recentLog: DayResolutionLog[]
+  patternCount: number
+  resolvedCount: number
+}
+
 interface N50State {
   prediction: N50Prediction
   snapshotCount: number
@@ -40,12 +71,14 @@ interface N50State {
   bearStockPct: number
   coverageCount: number
   minutesAccumulated: number
+  dayPrediction?: DayPredictionState
 }
 
 interface ConvictionResult {
   score: number
   direction: 'BULL' | 'BEAR' | null
   checks: Check[]
+  qualified: boolean
 }
 
 interface Check {
@@ -56,12 +89,15 @@ interface Check {
   detail: string
 }
 
+const MIN_PATTERN_N = 20
+
 function computeConviction(s: StockState): ConvictionResult {
   const checks: Check[] = []
   let bullPoints = 0, bearPoints = 0, maxPoints = 0
 
   // 1. Pattern agreement (weight: 3)
   const pats = [s.pat30_5, s.pat60_20, s.pat30v2].filter(Boolean) as NonNullable<typeof s.pat5>[]
+  const qualified = pats.some(p => p.n >= MIN_PATTERN_N)
   if (pats.length > 0) {
     maxPoints += 3
     const bullPats = pats.filter(p => p.bull > p.bear)
@@ -165,7 +201,7 @@ function computeConviction(s: StockState): ConvictionResult {
   const penalty = disagreement * 0.1
   const finalScore = Math.max(0, score - penalty)
 
-  return { score: finalScore, direction: dominant, checks }
+  return { score: finalScore, direction: dominant, checks, qualified }
 }
 
 function convictionTier(score: number): { label: string; color: string; bg: string } {
@@ -525,6 +561,143 @@ function N50PredictionPanel({ n50 }: { n50: N50State | null }) {
   )
 }
 
+// ── N50 Day Prediction Panel ──────────────────────────────────────────────
+
+function N50DayPredictionPanel({ n50 }: { n50: N50State | null }) {
+  const dp = n50?.dayPrediction
+  if (!dp) return null
+
+  const pred = dp.prediction
+  const log = dp.recentLog
+
+  const dirColor = (d: 'BULL' | 'BEAR' | null) =>
+    d === 'BULL' ? 'var(--bull)' : d === 'BEAR' ? 'var(--bear)' : 'var(--text3)'
+
+  const winCount = log.filter(l => l.correct).length
+  const lossCount = log.filter(l => !l.correct).length
+  const isResolved = pred && log.length > 0 && log[log.length - 1].targetDay === pred.targetDay
+
+  return (
+    <div style={{
+      padding: '16px', background: 'var(--bg2)', borderRadius: '8px',
+      border: `1px solid ${pred?.status === 'ready' && pred.direction ? dirColor(pred.direction) : 'var(--border)'}`,
+      display: 'flex', flexDirection: 'column', gap: '12px',
+    }}>
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px' }}>
+          <span style={{ fontSize: '13px', fontWeight: 700, letterSpacing: '-0.02em', color: 'var(--text)' }}>patN50-day-20</span>
+          <span style={{ fontSize: '10px', color: 'var(--text3)' }}>QKV Attention · EOD close → next day 20m open</span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '10px', color: 'var(--text3)' }}>{dp.patternCount} days captured</span>
+          <span style={{ fontSize: '10px', color: 'var(--text3)' }}>{dp.resolvedCount} resolved</span>
+        </div>
+      </div>
+
+      {/* Prediction */}
+      {!pred || pred.status === 'no_data' ? (
+        <div style={{ fontSize: '11px', color: 'var(--text3)', padding: '8px 0' }}>
+          Accumulating closing snapshots... Predictions start after 5 trading days.
+          <br /><span style={{ fontSize: '10px' }}>Captured: {dp.patternCount} | Resolved: {dp.resolvedCount} | Need: 5 minimum</span>
+        </div>
+      ) : pred.status === 'warming' ? (
+        <div style={{ fontSize: '11px', color: 'var(--mixed)', padding: '8px 0' }}>
+          Warming up — {dp.resolvedCount}/5 resolved day patterns.
+          <br /><span style={{ fontSize: '10px', color: 'var(--text3)' }}>Captured: {dp.patternCount} days</span>
+        </div>
+      ) : (
+        <>
+          {/* Direction + predicted move */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              {pred.direction && (
+                <span style={{
+                  fontSize: '14px', fontWeight: 700, color: dirColor(pred.direction),
+                  padding: '3px 10px', borderRadius: '4px',
+                  background: pred.direction === 'BULL' ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)',
+                }}>
+                  {pred.direction === 'BULL' ? '▲' : '▼'} {pred.direction}
+                </span>
+              )}
+              <span style={{ fontSize: '16px', fontWeight: 700, color: pred.predictedMove >= 0 ? 'var(--bull)' : 'var(--bear)' }}>
+                {pred.predictedMove >= 0 ? '+' : ''}{pred.predictedMove.toFixed(3)}%
+              </span>
+            </div>
+
+            {/* Target day */}
+            {pred.targetDay && (
+              <span style={{ fontSize: '11px', color: isResolved ? 'var(--text3)' : 'var(--text2)', fontWeight: 600 }}>
+                {isResolved
+                  ? `Resolved · ${log[log.length - 1].correct ? '✓ correct' : '✗ wrong'} · actual ${log[log.length - 1].actualProxy20 >= 0 ? '+' : ''}${log[log.length - 1].actualProxy20.toFixed(3)}%`
+                  : `Predicting ${pred.targetDay} open`}
+              </span>
+            )}
+
+            {/* Bull/Bear bar */}
+            <div style={{ flex: 1, minWidth: '100px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <span style={{ fontSize: '10px', fontWeight: 600, color: 'var(--bull)', width: '30px', textAlign: 'right' }}>{Math.round(pred.bullProb * 100)}%</span>
+              <div style={{ flex: 1, height: '6px', background: 'var(--bg3)', borderRadius: '3px', overflow: 'hidden', display: 'flex' }}>
+                <div style={{ width: `${Math.round(pred.bullProb * 100)}%`, height: '100%', background: 'var(--bull)', borderRadius: '3px 0 0 3px' }} />
+                <div style={{ width: `${Math.round(pred.bearProb * 100)}%`, height: '100%', background: 'var(--bear)', borderRadius: '0 3px 3px 0' }} />
+              </div>
+              <span style={{ fontSize: '10px', fontWeight: 600, color: 'var(--bear)', width: '30px' }}>{Math.round(pred.bearProb * 100)}%</span>
+            </div>
+          </div>
+
+          {/* Model stats */}
+          <div style={{ display: 'flex', gap: '16px', fontSize: '10px', flexWrap: 'wrap', color: 'var(--text3)' }}>
+            <span>sim: <span style={{ color: 'var(--text2)', fontWeight: 600 }}>{pred.topSim.toFixed(3)}</span></span>
+            <span>conf: <span style={{ color: 'var(--text2)', fontWeight: 600 }}>{(pred.confidence * 100).toFixed(0)}%</span></span>
+            <span>n: <span style={{ color: 'var(--text2)', fontWeight: 600 }}>{pred.nResolved}</span></span>
+            {pred.captureDay && <span>from: <span style={{ color: 'var(--text2)', fontWeight: 600 }}>{pred.captureDay}</span></span>}
+          </div>
+        </>
+      )}
+
+      {/* Resolution log */}
+      {log.length > 0 && (
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
+            <span style={{ fontSize: '9px', color: 'var(--text3)', letterSpacing: '0.1em' }}>TRACK RECORD</span>
+            {log.length >= 2 && (
+              <span style={{ fontSize: '10px', color: 'var(--text2)', fontWeight: 600 }}>
+                {winCount}W {lossCount}L
+                {log.length >= 3 && ` · ${Math.round((winCount / log.length) * 100)}%`}
+              </span>
+            )}
+          </div>
+          <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+            {log.map((entry, i) => (
+              <div key={i} title={`${entry.captureDay} → ${entry.targetDay}\nPredicted: ${entry.predictedDirection ?? '—'} ${entry.predictedMove >= 0 ? '+' : ''}${entry.predictedMove.toFixed(3)}%\nActual: ${entry.actualProxy20 >= 0 ? '+' : ''}${entry.actualProxy20.toFixed(3)}%\nError: ${entry.error.toFixed(3)}%`}
+                style={{
+                  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px',
+                  padding: '4px 6px', borderRadius: '4px',
+                  background: entry.correct ? 'rgba(34,197,94,0.08)' : 'rgba(239,68,68,0.08)',
+                  border: `1px solid ${entry.correct ? 'rgba(34,197,94,0.2)' : 'rgba(239,68,68,0.2)'}`,
+                  cursor: 'default',
+                }}>
+                <span style={{ fontSize: '10px', fontWeight: 700, color: entry.correct ? 'var(--bull)' : 'var(--bear)' }}>
+                  {entry.correct ? '✓' : '✗'}
+                </span>
+                <span style={{ fontSize: '8px', color: 'var(--text3)' }}>
+                  {entry.targetDay.slice(5)}
+                </span>
+                <span style={{ fontSize: '8px', color: dirColor(entry.predictedDirection), fontWeight: 600 }}>
+                  {entry.predictedDirection === 'BULL' ? '▲' : entry.predictedDirection === 'BEAR' ? '▼' : '—'}
+                </span>
+                <span style={{ fontSize: '8px', color: entry.actualProxy20 >= 0 ? 'var(--bull)' : 'var(--bear)' }}>
+                  {entry.actualProxy20 >= 0 ? '+' : ''}{entry.actualProxy20.toFixed(2)}%
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Styles ───────────────────────────────────────────────────────────────────
 
 const btnStyle: React.CSSProperties = {
@@ -591,10 +764,11 @@ export default function ConvictionClient() {
   convictions.sort((a, b) => b.conviction.score - a.conviction.score)
 
   const filtered = convictions.filter(({ stock, conviction }) => {
+    if (filter === 'positions') return positions.some(p => p.stock === stock.name)
+    if (!conviction.qualified) return false
     if (filter === 'nifty50') return NIFTY50_SET.has(stock.name)
     if (filter === 'strong') return conviction.score >= 0.7
     if (filter === 'partial') return conviction.score >= 0.45
-    if (filter === 'positions') return positions.some(p => p.stock === stock.name)
     return true
   })
 
@@ -643,7 +817,7 @@ export default function ConvictionClient() {
             {status === 'live' && updatedAt ? `Live · ${new Date(updatedAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })} IST` : status}
           </span>
           <span style={{ fontSize: '10px', color: 'var(--text3)' }}>
-            {filtered.length} stocks · {convictions.filter(c => c.conviction.score >= 0.7).length} strong
+            {filtered.length} stocks · {convictions.filter(c => c.conviction.qualified).length}/{stocks.length} qualified · {convictions.filter(c => c.conviction.score >= 0.7 && c.conviction.qualified).length} strong
             {filter === 'nifty50' && n50 ? ` · ${n50.coverageCount}/50 covered` : ''}
           </span>
         </div>
@@ -662,10 +836,11 @@ export default function ConvictionClient() {
         </div>
       </div>
 
-      {/* N50 prediction panel */}
+      {/* N50 prediction panels */}
       {filter === 'nifty50' && (
-        <div style={{ padding: '12px 16px 0' }}>
+        <div style={{ padding: '12px 16px 0', display: 'flex', flexDirection: 'column', gap: '12px' }}>
           <N50PredictionPanel n50={n50} />
+          <N50DayPredictionPanel n50={n50} />
         </div>
       )}
 
@@ -685,7 +860,7 @@ export default function ConvictionClient() {
         display: 'grid',
         gridTemplateColumns: 'repeat(auto-fill, minmax(min(380px, 100%), 1fr))',
         gap: '10px',
-        alignContent: 'start',
+        alignItems: 'start',
       }}>
         {filtered.length === 0 && (
           <div style={{ gridColumn: '1 / -1', textAlign: 'center', padding: '60px 0', color: 'var(--text3)', fontSize: '12px' }}>
