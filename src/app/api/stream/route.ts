@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
-import { readStockState, sortedStocks, readStockPrices } from '@/lib/stockState'
+import { readStockState, sortedStocks, readStockPrices, readPositions } from '@/lib/stockState'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
@@ -38,12 +38,13 @@ export async function GET(_req: NextRequest) {
 
       send(makeSnapshot(state))
 
-      // Poll prices every 1s — fast ltp/signal/cdZ/trend updates
+      // Poll prices every 1s — fast ltp/signal/cdZ/trend + positions updates
       const pricesInterval = setInterval(() => {
         if (closed) { clearInterval(pricesInterval); return }
         const p = readStockPrices()
         if (!p) return
-        send({ type: 'prices', prices: p.prices, updatedAt: p.updatedAt })
+        const posData = readPositions()
+        send({ type: 'prices', prices: p.prices, updatedAt: p.updatedAt, positions: posData?.positions, capital: posData?.capital })
       }, 1000)
 
       // Full snapshot every 10s — includes pat data and positions

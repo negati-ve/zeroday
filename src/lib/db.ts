@@ -78,18 +78,28 @@ function migrate(db: DatabaseSync) {
   try { db.exec('ALTER TABLE strategies ADD COLUMN config_hash TEXT') } catch {}
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_strategies_hash ON strategies(user_id, config_hash)') } catch {}
 
+  // Add role column to users (migration for existing DBs)
+  try { db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'") } catch {}
+
   // Seed default admin user if not present
   const existing = db.prepare('SELECT id FROM users WHERE username = ?').get('zee')
   if (!existing) {
     const hash = bcrypt.hashSync('26551753', 10)
     db.prepare('INSERT INTO users (username, password_hash) VALUES (?, ?)').run('zee', hash)
   }
+
+  // Seed viewer user if not present
+  const existingHima = db.prepare('SELECT id FROM users WHERE username = ?').get('hima')
+  if (!existingHima) {
+    const himaHash = bcrypt.hashSync('mastersoftheuniverse', 10)
+    db.prepare('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)').run('hima', himaHash, 'viewer')
+  }
 }
 
 export function getUserByUsername(username: string) {
   return getDb()
     .prepare('SELECT * FROM users WHERE username = ?')
-    .get(username) as { id: number; username: string; password_hash: string } | undefined
+    .get(username) as { id: number; username: string; password_hash: string; role: string } | undefined
 }
 
 export function createSession(userId: number): string {
@@ -104,8 +114,8 @@ export function createSession(userId: number): string {
 export function getSession(id: string) {
   const now = Math.floor(Date.now() / 1000)
   return getDb()
-    .prepare('SELECT * FROM sessions WHERE id = ? AND expires_at > ?')
-    .get(id, now) as { id: string; user_id: number } | undefined
+    .prepare('SELECT s.id, s.user_id, u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ? AND s.expires_at > ?')
+    .get(id, now) as { id: string; user_id: number; role: string } | undefined
 }
 
 export function deleteSession(id: string) {

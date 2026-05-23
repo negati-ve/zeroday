@@ -109,6 +109,8 @@ export interface CapitalData {
   span: number
   exposure: number
   m2mUnreal: number
+  realizedToday?: number
+  openPnl?: number
   fetchedAt: number
 }
 
@@ -156,6 +158,16 @@ export function readStockPrices(): StockPricesFile | null {
   try {
     const raw = fs.readFileSync(PRICES_FILE, 'utf8')
     return JSON.parse(raw) as StockPricesFile
+  } catch {
+    return null
+  }
+}
+
+export function readPositions(): { positions: Position[]; capital: CapitalData | null } | null {
+  try {
+    const raw = fs.readFileSync(STATE_FILE, 'utf8')
+    const parsed = JSON.parse(raw) as { positions?: Position[]; capital?: CapitalData | null }
+    return { positions: parsed.positions ?? [], capital: parsed.capital ?? null }
   } catch {
     return null
   }

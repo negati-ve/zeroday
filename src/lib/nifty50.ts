@@ -2,7 +2,7 @@ import fs from 'fs'
 import path from 'path'
 import type { StockState, StockStateFile } from './stockState'
 import { readStockState } from './stockState'
-import { getISTDateStr, getISTHourMin, getNextTradingDay } from './tradingCalendar'
+import { getISTHourMin, getNextTradingDay } from './tradingCalendar'
 
 // ── NIFTY 50 Constituents (May 2026) ───────────────────────────────────────
 
@@ -22,13 +22,38 @@ export const NIFTY50_STOCKS = [
 const FEATURES_PER_STOCK = 6
 const VEC_DIM = NIFTY50_STOCKS.length * FEATURES_PER_STOCK
 
+// Approximate NIFTY 50 free-float market-cap weights (%, May 2026)
+// Source: niftyindices.com — updated semi-annually, stable ±0.5% between reviews
+export const NIFTY50_WEIGHTS: Record<string, number> = {
+  HDFCBANK: 13.1, RELIANCE: 8.8, ICICIBANK: 8.3, INFY: 6.1, TCS: 4.4,
+  BHARTIARTL: 4.0, ITC: 3.9, LT: 3.5, SBIN: 3.1, AXISBANK: 2.5,
+  KOTAKBANK: 2.4, 'M&M': 2.2, HCLTECH: 2.0, SUNPHARMA: 1.9, BAJFINANCE: 1.8,
+  TITAN: 1.7, MARUTI: 1.6, NTPC: 1.5, TATASTEEL: 1.4, ULTRACEMCO: 1.4,
+  ADANIENT: 1.3, HINDUNILVR: 1.3, POWERGRID: 1.3, ONGC: 1.2, COALINDIA: 1.1,
+  WIPRO: 1.1, JSWSTEEL: 1.0, BAJAJFINSV: 1.0, GRASIM: 1.0, TRENT: 0.9,
+  INDIGO: 0.9, NESTLEIND: 0.8, TATACONSUM: 0.8, 'BAJAJ-AUTO': 0.8,
+  APOLLOHOSP: 0.8, ASIANPAINT: 0.8, CIPLA: 0.7, TECHM: 0.7, BEL: 0.7,
+  DRREDDY: 0.7, ADANIPORTS: 0.7, ETERNAL: 0.6, HDFCLIFE: 0.6, SBILIFE: 0.6,
+  HINDALCO: 0.6, SHRIRAMFIN: 0.5, EICHERMOT: 0.5, JIOFIN: 0.4, MAXHEALTH: 0.4,
+  TMPV: 0.3, LODHA: 0.3, INDUSINDBK: 0.3, MANKIND: 0.3, PRESTIGE: 0.2,
+  DIXON: 0.2, BPCL: 0.2,
+}
+
+const HEAVYWEIGHT_THRESHOLD = 2.0
+export const NIFTY50_HEAVYWEIGHTS = NIFTY50_STOCKS.filter(s => (NIFTY50_WEIGHTS[s] ?? 0) >= HEAVYWEIGHT_THRESHOLD)
+
+function getWeight(stock: string): number {
+  return NIFTY50_WEIGHTS[stock] ?? (100 / NIFTY50_STOCKS.length)
+}
+
+
 const PATTERN_FILE = path.join('/workspace/option-trader', 'nifty50-patterns.json')
 const SNAPSHOT_INTERVAL_MS = 60_000
 const MAX_SNAPSHOTS = 120
 const MAX_PATTERNS = 1000
 const OUTCOME_HORIZON_MS = 20 * 60_000
-const TEMPERATURE = 0.3
-const KNN_K = 30
+const TEMPERATURE = 0.10
+const KNN_K = 10
 const QUERY_DECAY = 0.05
 const MIN_PATTERNS_FOR_PREDICTION = 10
 const PERSIST_INTERVAL_MS = 5 * 60_000
@@ -71,8 +96,49 @@ export interface N50Prediction {
   status: 'ready' | 'warming' | 'no_data'
 }
 
+export interface N50Technicals {
+  avgRsi: number | null
+  avgAtrPct: number | null
+  vwapBullPct: number
+  vwapBearPct: number
+  emaBullPct: number
+  emaBearPct: number
+  avgCdZ: number
+  cusumBullCount: number
+  cusumBearCount: number
+  avgImbalance: number
+  avgAggRatio: number
+  trendBullPct: number
+  trendBearPct: number
+  stocksWithIndicators: number
+  pat60_20: { avgBull: number; avgBear: number; avgMove: number; n: number } | null
+  heavyweights?: {
+    bullPct: number
+    bearPct: number
+    neutPct: number
+    totalWeight: number
+  }
+}
+
+export interface N50Composite {
+  predictedMove: number
+  bullProb: number
+  bearProb: number
+  direction: 'BULL' | 'BEAR' | null
+  confidence: number
+  status: 'ready' | 'warming' | 'no_data'
+  components: {
+    patternWeight: number
+    techWeight: number
+    patternBullProb: number
+    techBullScore: number
+  }
+}
+
 export interface N50State {
   prediction: N50Prediction
+  technicals: N50Technicals
+  composite: N50Composite
   snapshotCount: number
   patternCount: number
   resolvedCount: number
@@ -82,6 +148,44 @@ export interface N50State {
   coverageCount: number
   minutesAccumulated: number
   dayPrediction?: DayPredictionState
+  sysLog?: SysLogEntry[]
+  niftySpot?: number
+  heavyweights?: HeavyweightDetail[]
+}
+
+export interface HeavyweightDetail {
+  name: string
+  weight: number
+  ltp: number
+  trend: string
+  cdZ: number
+  signal: string
+  vwap: string
+  pat30v2Bull: number
+  pat30v2Bear: number
+}
+
+// ── SysLog Types ──────────────────────────────────────────────────────────
+
+export interface SysLogEntry {
+  cycleTs: number
+  cycleTime: string
+  predMove: number
+  predDir: 'BULL' | 'BEAR' | null
+  predConf: number
+  predBullProb: number
+  predBearProb: number
+  niftySpotAtPred: number
+  predSpot: number
+  outcomeMove: number | null
+  outcomeDir: 'BULL' | 'BEAR' | null
+  niftySpotAtOutcome: number | null
+  resolved: boolean
+  correct: boolean | null
+  sessionDay: string
+  peakMove?: number | null
+  targetHit?: boolean
+  targetHitTs?: number | null
 }
 
 // ── Day-Ahead Prediction Types ────────────────────────────────────────────
@@ -167,6 +271,123 @@ let dayStore: DayStore = {
 }
 let dayStoreLoaded = false
 
+// ── SysLog Store ──────────────────────────────────────────────────────────
+
+const SYSLOG_FILE = path.join('/workspace/option-trader', 'nifty50-syslog.json')
+const SYSLOG_CYCLE_MS = 20 * 60_000
+const MAX_SYSLOG_ENTRIES = 200
+
+interface SysLogStore {
+  entries: SysLogEntry[]
+  lastCycleTs: number
+}
+
+let sysLogStore: SysLogStore = { entries: [], lastCycleTs: 0 }
+let sysLogLoaded = false
+
+function ensureSysLogLoaded() {
+  if (sysLogLoaded) return
+  sysLogLoaded = true
+  try {
+    const raw = fs.readFileSync(SYSLOG_FILE, 'utf8')
+    const saved = JSON.parse(raw) as Partial<SysLogStore>
+    if (Array.isArray(saved.entries)) sysLogStore.entries = saved.entries.slice(-MAX_SYSLOG_ENTRIES)
+    if (saved.lastCycleTs) sysLogStore.lastCycleTs = saved.lastCycleTs
+  } catch { /* no file yet */ }
+}
+
+function persistSysLog() {
+  try {
+    fs.writeFileSync(SYSLOG_FILE, JSON.stringify({
+      entries: sysLogStore.entries.slice(-MAX_SYSLOG_ENTRIES),
+      lastCycleTs: sysLogStore.lastCycleTs,
+      savedAt: Date.now(),
+    }))
+  } catch { /* ignore */ }
+}
+
+export function updateSysLog(composite: N50Composite, niftySpot: number): SysLogEntry[] {
+  ensureSysLogLoaded()
+  const now = Date.now()
+  const ist = getISTHourMin(now)
+  const mins = ist.hour * 60 + ist.minute
+  const inWindow = mins >= 9 * 60 + 20 && mins <= 15 * 60 + 30
+
+  let changed = false
+  for (const entry of sysLogStore.entries) {
+    if (entry.resolved) continue
+    const spotDiff = niftySpot - entry.niftySpotAtPred
+    const currentMove = entry.niftySpotAtPred > 0 ? (spotDiff / entry.niftySpotAtPred) * 100 : 0
+    const moveDir = entry.predMove > 0 ? 'BULL' : entry.predMove < 0 ? 'BEAR' : null
+
+    // Track peak move in predicted direction during the 20-min window
+    if (!entry.targetHit && niftySpot > 0 && moveDir) {
+      const prev = entry.peakMove ?? 0
+      if (moveDir === 'BULL' && currentMove > prev) { entry.peakMove = currentMove; changed = true }
+      else if (moveDir === 'BEAR' && currentMove < prev) { entry.peakMove = currentMove; changed = true }
+
+      // Check if predicted target was reached at any point
+      if (moveDir === 'BULL' && currentMove >= entry.predMove) {
+        entry.targetHit = true; entry.targetHitTs = now; changed = true
+      } else if (moveDir === 'BEAR' && currentMove <= entry.predMove) {
+        entry.targetHit = true; entry.targetHitTs = now; changed = true
+      }
+    }
+
+    // Resolve: at +20 min OR immediately on target hit
+    const timeUp = now - entry.cycleTs >= SYSLOG_CYCLE_MS
+    if (!timeUp && !entry.targetHit) continue
+    entry.outcomeMove = currentMove
+    entry.outcomeDir = spotDiff > 0 ? 'BULL' : spotDiff < 0 ? 'BEAR' : null
+    entry.niftySpotAtOutcome = niftySpot
+    entry.resolved = true
+    const effectiveDir = entry.predDir ?? moveDir
+    entry.correct = effectiveDir !== null && (
+      entry.targetHit === true || effectiveDir === entry.outcomeDir
+    )
+    changed = true
+  }
+  if (changed) {
+    persistSysLog()
+    // Reset cycle timer so a new prediction starts immediately after early resolution
+    const lastEntry = sysLogStore.entries[sysLogStore.entries.length - 1]
+    if (lastEntry?.resolved && lastEntry.targetHit && now - lastEntry.cycleTs < SYSLOG_CYCLE_MS) {
+      sysLogStore.lastCycleTs = 0
+    }
+  }
+
+  if (inWindow && now - sysLogStore.lastCycleTs >= SYSLOG_CYCLE_MS && composite.status === 'ready' && niftySpot > 0) {
+    const currentDay = new Date(now + 5.5 * 3600_000).toISOString().slice(0, 10)
+    sysLogStore.entries.push({
+      cycleTs: now,
+      cycleTime: `${String(ist.hour).padStart(2, '0')}:${String(ist.minute).padStart(2, '0')}`,
+      predMove: composite.predictedMove,
+      predDir: composite.direction,
+      predConf: composite.confidence,
+      predBullProb: composite.bullProb,
+      predBearProb: composite.bearProb,
+      niftySpotAtPred: niftySpot,
+      predSpot: niftySpot * (1 + composite.predictedMove / 100),
+      outcomeMove: null,
+      outcomeDir: null,
+      niftySpotAtOutcome: null,
+      resolved: false,
+      correct: null,
+      sessionDay: currentDay,
+      peakMove: null,
+      targetHit: false,
+      targetHitTs: null,
+    })
+    if (sysLogStore.entries.length > MAX_SYSLOG_ENTRIES) {
+      sysLogStore.entries = sysLogStore.entries.slice(-MAX_SYSLOG_ENTRIES)
+    }
+    sysLogStore.lastCycleTs = now
+    persistSysLog()
+  }
+
+  return sysLogStore.entries.slice(-30)
+}
+
 function ensureLoaded() {
   if (loaded) return
   loaded = true
@@ -224,6 +445,202 @@ function buildFeatureVector(stocks: Record<string, StockState>): { vec: number[]
     }
   }
   return { vec, count }
+}
+
+// ── Technical Aggregates ───────────────────────────────────────────────────
+
+function computeTechAggregates(stocks: Record<string, StockState>): N50Technicals {
+  let rsiWSum = 0, rsiW = 0
+  let atrPctWSum = 0, atrW = 0
+  let vwapBullW = 0, vwapBearW = 0, vwapTotalW = 0
+  let emaBullW = 0, emaBearW = 0, emaTotalW = 0
+  let cdZWSum = 0, cdZW = 0
+  let cusumBullW = 0, cusumBearW = 0
+  let imbWSum = 0, aggWSum = 0, flowW = 0
+  let trendBullW = 0, trendBearW = 0, trendTotalW = 0
+  let pat60BullW = 0, pat60BearW = 0, pat60MoveW = 0, pat60W = 0
+  let hwBullW = 0, hwBearW = 0, hwNeutW = 0, hwTotalW = 0
+
+  for (const name of NIFTY50_STOCKS) {
+    const s = stocks[name]
+    if (!s || s.ltp <= 0) continue
+    const w = getWeight(name)
+
+    if (s.indicators) {
+      if (s.indicators.rsi != null) { rsiWSum += s.indicators.rsi * w; rsiW += w }
+      if (s.indicators.atrPct != null) { atrPctWSum += s.indicators.atrPct * w; atrW += w }
+      if (s.indicators.vwapAlign === 'BULL') vwapBullW += w
+      else if (s.indicators.vwapAlign === 'BEAR') vwapBearW += w
+      if (s.indicators.vwapAlign) vwapTotalW += w
+      if (s.indicators.emaCrossover === 'BULL') emaBullW += w
+      else if (s.indicators.emaCrossover === 'BEAR') emaBearW += w
+      if (s.indicators.emaCrossover) emaTotalW += w
+    }
+
+    if (s.cdZ != null && s.cdZ !== 0) { cdZWSum += s.cdZ * w; cdZW += w }
+    if (s.cusumBull) cusumBullW += w
+    if (s.cusumBear) cusumBearW += w
+    if (s.imbalance != null) { imbWSum += s.imbalance * w; flowW += w }
+    if (s.aggRatio != null) { aggWSum += s.aggRatio * w }
+
+    if (s.trend === 'BULL') trendBullW += w
+    else if (s.trend === 'BEAR') trendBearW += w
+    if (s.trend) trendTotalW += w
+
+    if (s.pat60_20) {
+      pat60BullW += s.pat60_20.bull * w
+      pat60BearW += s.pat60_20.bear * w
+      pat60MoveW += s.pat60_20.move * w
+      pat60W += w
+    }
+
+    if ((NIFTY50_WEIGHTS[name] ?? 0) >= HEAVYWEIGHT_THRESHOLD) {
+      hwTotalW += w
+      if (s.trend === 'BULL') hwBullW += w
+      else if (s.trend === 'BEAR') hwBearW += w
+      else hwNeutW += w
+    }
+  }
+
+  return {
+    avgRsi: rsiW > 0 ? rsiWSum / rsiW : null,
+    avgAtrPct: atrW > 0 ? atrPctWSum / atrW : null,
+    vwapBullPct: vwapTotalW > 0 ? Math.round((vwapBullW / vwapTotalW) * 100) : 0,
+    vwapBearPct: vwapTotalW > 0 ? Math.round((vwapBearW / vwapTotalW) * 100) : 0,
+    emaBullPct: emaTotalW > 0 ? Math.round((emaBullW / emaTotalW) * 100) : 0,
+    emaBearPct: emaTotalW > 0 ? Math.round((emaBearW / emaTotalW) * 100) : 0,
+    avgCdZ: cdZW > 0 ? cdZWSum / cdZW : 0,
+    cusumBullCount: cusumBullW,
+    cusumBearCount: cusumBearW,
+    avgImbalance: flowW > 0 ? imbWSum / flowW : 0,
+    avgAggRatio: flowW > 0 ? aggWSum / flowW : 0,
+    trendBullPct: trendTotalW > 0 ? Math.round((trendBullW / trendTotalW) * 100) : 0,
+    trendBearPct: trendTotalW > 0 ? Math.round((trendBearW / trendTotalW) * 100) : 0,
+    stocksWithIndicators: Math.max(1, Math.round(rsiW + atrW + vwapTotalW + emaTotalW) / 4),
+    pat60_20: pat60W > 0 ? {
+      avgBull: Math.round(pat60BullW / pat60W),
+      avgBear: Math.round(pat60BearW / pat60W),
+      avgMove: pat60MoveW / pat60W,
+      n: Math.round(pat60W),
+    } : null,
+    heavyweights: {
+      bullPct: hwTotalW > 0 ? Math.round((hwBullW / hwTotalW) * 100) : 0,
+      bearPct: hwTotalW > 0 ? Math.round((hwBearW / hwTotalW) * 100) : 0,
+      neutPct: hwTotalW > 0 ? Math.round((hwNeutW / hwTotalW) * 100) : 0,
+      totalWeight: Math.round(hwTotalW),
+    },
+  }
+}
+
+function computeComposite(
+  prediction: N50Prediction,
+  tech: N50Technicals,
+): N50Composite {
+  // Technical bull score: aggregate directional signal from technicals (range 0..1)
+  // Each component contributes a weighted vote
+  const votes: { score: number; weight: number }[] = []
+
+  // VWAP alignment: strong directional signal
+  if (tech.vwapBullPct + tech.vwapBearPct > 0) {
+    votes.push({ score: tech.vwapBullPct / (tech.vwapBullPct + tech.vwapBearPct), weight: 1.0 })
+  }
+
+  // EMA crossover: trend direction
+  if (tech.emaBullPct + tech.emaBearPct > 0) {
+    votes.push({ score: tech.emaBullPct / (tech.emaBullPct + tech.emaBearPct), weight: 1.0 })
+  }
+
+  // 5-min trend: momentum direction
+  if (tech.trendBullPct + tech.trendBearPct > 0) {
+    votes.push({ score: tech.trendBullPct / (tech.trendBullPct + tech.trendBearPct), weight: 0.8 })
+  }
+
+  // RSI: >55 bullish, <45 bearish (normalized to 0..1)
+  if (tech.avgRsi != null) {
+    votes.push({ score: Math.max(0, Math.min(1, (tech.avgRsi - 30) / 40)), weight: 0.7 })
+  }
+
+  // CD Z-score: positive = bull (sigmoid mapping)
+  if (tech.avgCdZ !== 0) {
+    const cdSig = 1 / (1 + Math.exp(-tech.avgCdZ))
+    votes.push({ score: cdSig, weight: 1.2 })
+  }
+
+  // CUSUM alarms: strong directional evidence
+  if (tech.cusumBullCount > 0 || tech.cusumBearCount > 0) {
+    const total = tech.cusumBullCount + tech.cusumBearCount
+    votes.push({ score: tech.cusumBullCount / total, weight: 1.5 })
+  }
+
+  // OBI (avg imbalance): -1..+1 → 0..1
+  if (Math.abs(tech.avgImbalance) > 0.01) {
+    votes.push({ score: (tech.avgImbalance + 1) / 2, weight: 0.6 })
+  }
+
+  // Aggression ratio: -1..+1 → 0..1
+  if (Math.abs(tech.avgAggRatio) > 0.01) {
+    votes.push({ score: (tech.avgAggRatio + 1) / 2, weight: 0.5 })
+  }
+
+  // Pat60_20 aggregate: per-stock 60-min lookback, 20-min outcome patterns
+  if (tech.pat60_20) {
+    votes.push({ score: tech.pat60_20.avgBull / 100, weight: 1.0 })
+  }
+
+  let techBullScore = 0.5
+  if (votes.length > 0) {
+    const totalW = votes.reduce((s, v) => s + v.weight, 0)
+    techBullScore = votes.reduce((s, v) => s + v.score * v.weight, 0) / totalW
+  }
+
+  // Blend pattern KNN prediction with technical aggregate
+  // Pattern weight scales with confidence and resolved count
+  const patternReady = prediction.status === 'ready' && prediction.nResolved >= MIN_PATTERNS_FOR_PREDICTION
+  const patternWeight = patternReady ? 0.5 + 0.2 * Math.min(1, prediction.confidence / 0.3) : 0
+  const techWeight = votes.length >= 3 ? 1 - patternWeight : 0
+  const totalWeight = patternWeight + techWeight
+
+  if (totalWeight === 0) {
+    return {
+      predictedMove: 0, bullProb: 0.5, bearProb: 0.5,
+      direction: null, confidence: 0, status: 'no_data',
+      components: { patternWeight: 0, techWeight: 0, patternBullProb: 0.5, techBullScore: 0.5 },
+    }
+  }
+
+  const blendedBull = totalWeight > 0
+    ? (patternWeight * prediction.bullProb + techWeight * techBullScore) / totalWeight
+    : 0.5
+  const blendedBear = 1 - blendedBull
+
+  // Blended move: weighted combination of pattern move and tech-implied move
+  // Median 20-min NIFTY |move| ≈ 0.05%, P90 ≈ 0.16%. Scale tech signal to this range.
+  const TYPICAL_MOVE = 0.08
+  const patMove = patternReady ? prediction.predictedMove : 0
+  const techDeviation = (techBullScore - 0.5) * 2
+  const techImpliedMove = techDeviation * TYPICAL_MOVE
+  const blendedMove = totalWeight > 0
+    ? (patternWeight * patMove + techWeight * techImpliedMove) / totalWeight
+    : techImpliedMove
+
+  const conf = patternReady
+    ? prediction.confidence * (0.7 + 0.3 * Math.abs(techBullScore - 0.5) * 2)
+    : Math.abs(techBullScore - 0.5) * 2
+
+  return {
+    predictedMove: blendedMove,
+    bullProb: blendedBull,
+    bearProb: blendedBear,
+    direction: blendedBull >= 0.55 ? 'BULL' : blendedBear >= 0.55 ? 'BEAR' : null,
+    confidence: Math.min(1, conf),
+    status: patternReady || votes.length >= 3 ? 'ready' : votes.length > 0 ? 'warming' : 'no_data',
+    components: {
+      patternWeight: totalWeight > 0 ? patternWeight / totalWeight : 0,
+      techWeight: totalWeight > 0 ? techWeight / totalWeight : 0,
+      patternBullProb: prediction.bullProb,
+      techBullScore,
+    },
+  }
 }
 
 // ── NIFTY Proxy ────────────────────────────────────────────────────────────
@@ -596,8 +1013,31 @@ export function getN50State(): N50State {
     captureClosingSnapshot(queryVec, proxy, currentDay)
   }
 
+  const technicals = computeTechAggregates(stocks)
+  const composite = computeComposite(prediction, technicals)
+
+  const hwDetail: HeavyweightDetail[] = []
+  for (const name of NIFTY50_HEAVYWEIGHTS) {
+    const s = stocks[name]
+    if (!s || s.ltp <= 0) continue
+    hwDetail.push({
+      name,
+      weight: NIFTY50_WEIGHTS[name] ?? 0,
+      ltp: s.ltp,
+      trend: s.trend ?? 'NEUTRAL',
+      cdZ: s.cdZ ?? 0,
+      signal: s.signal ?? 'NEUTRAL',
+      vwap: s.indicators?.vwapAlign ?? 'NEUTRAL',
+      pat30v2Bull: s.pat30v2?.bull ?? 50,
+      pat30v2Bear: s.pat30v2?.bear ?? 50,
+    })
+  }
+  hwDetail.sort((a, b) => b.weight - a.weight)
+
   return {
     prediction,
+    technicals,
+    composite,
     snapshotCount: store.snapshots.length,
     patternCount: store.patterns.length,
     resolvedCount: store.patterns.filter(p => p.outcome20 !== null).length,
@@ -607,6 +1047,7 @@ export function getN50State(): N50State {
     coverageCount: count,
     minutesAccumulated,
     dayPrediction: getDayPredictionState(),
+    heavyweights: hwDetail,
   }
 }
 
@@ -616,11 +1057,26 @@ export function persistN50() {
 
 function emptyState(): N50State {
   ensureDayStoreLoaded()
+  const emptyPred: N50Prediction = {
+    predictedMove: 0, bullProb: 0.5, bearProb: 0.5,
+    topSim: 0, confidence: 0, nResolved: 0,
+    direction: null, status: 'no_data',
+  }
   return {
-    prediction: {
+    prediction: emptyPred,
+    technicals: {
+      avgRsi: null, avgAtrPct: null,
+      vwapBullPct: 0, vwapBearPct: 0,
+      emaBullPct: 0, emaBearPct: 0,
+      avgCdZ: 0, cusumBullCount: 0, cusumBearCount: 0,
+      avgImbalance: 0, avgAggRatio: 0,
+      trendBullPct: 0, trendBearPct: 0,
+      stocksWithIndicators: 0, pat60_20: null,
+    },
+    composite: {
       predictedMove: 0, bullProb: 0.5, bearProb: 0.5,
-      topSim: 0, confidence: 0, nResolved: 0,
-      direction: null, status: 'no_data',
+      direction: null, confidence: 0, status: 'no_data',
+      components: { patternWeight: 0, techWeight: 0, patternBullProb: 0.5, techBullScore: 0.5 },
     },
     snapshotCount: 0, patternCount: 0, resolvedCount: 0,
     niftyProxy: 0, bullStockPct: 0, bearStockPct: 0,

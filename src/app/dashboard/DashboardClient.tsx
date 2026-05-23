@@ -276,13 +276,12 @@ function fmtINR(n: number): string {
 
 function AccountBar({ capital, positions }: { capital: CapitalData | null; positions: Position[] }) {
   const available = capital?.net ?? null
-  // Holdings = current market value of all open positions
   const holdings = positions.reduce((sum, p) => sum + (p.currentBid != null ? p.currentBid * p.lotSize : 0), 0)
-  // Open P&L = unrealized gain/loss
   const openPnl = positions.reduce((sum, p) => sum + (p.pnl ?? 0), 0)
-  // Total account value = available cash + market value of holdings
   const total = available != null ? available + holdings : null
   const pnlColor = openPnl >= 0 ? 'var(--bull)' : 'var(--bear)'
+  const realizedToday = capital?.realizedToday ?? 0
+  const realColor = realizedToday >= 0 ? 'var(--bull)' : 'var(--bear)'
 
   const cell: React.CSSProperties = {
     display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px', minWidth: '70px',
@@ -330,10 +329,18 @@ function AccountBar({ capital, positions }: { capital: CapitalData | null; posit
         </span>
       </div>
       {capital && (
-        <div style={{ fontSize: '9px', color: 'var(--text3)', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-          <span>margin ₹{fmtINR(capital.totalUsed)}</span>
-          <span>m2m ₹{capital.m2mUnreal >= 0 ? '+' : ''}{fmtINR(capital.m2mUnreal)}</span>
-        </div>
+        <>
+          {capital.cash > 0 && (
+            <div style={{ fontSize: '9px', color: 'var(--text3)' }}>
+              open ₹{fmtINR(capital.cash)}
+            </div>
+          )}
+          {realizedToday !== 0 && (
+            <div style={{ fontSize: '9px', color: realColor, fontWeight: 600 }}>
+              today {realizedToday >= 0 ? '+' : ''}₹{fmtINR(realizedToday)}
+            </div>
+          )}
+        </>
       )}
     </div>
   )
@@ -423,7 +430,7 @@ function loadFilters(): Set<FilterKey> {
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 
-export default function DashboardClient() {
+export default function DashboardClient({ role = 'admin' }: { role?: string }) {
   const router = useRouter()
   const [stocks, setStocks] = useState<StockEntry[]>([])
   const [positions, setPositions] = useState<Position[]>([])
@@ -669,6 +676,27 @@ export default function DashboardClient() {
           </a>
 
           <a
+            href="/dashboard/conviction-crude"
+            style={{
+              background: 'transparent',
+              border: '1px solid var(--border)',
+              borderRadius: '4px',
+              padding: '4px 10px',
+              color: 'var(--text2)',
+              fontSize: '11px',
+              fontFamily: 'inherit',
+              cursor: 'pointer',
+              letterSpacing: '0.05em',
+              textDecoration: 'none',
+              display: 'inline-flex',
+              alignItems: 'center',
+            }}
+            title="Crude Oil Conviction"
+          >
+            CRUDE
+          </a>
+
+          <a
             href="/dashboard/live"
             style={{
               background: 'transparent',
@@ -709,11 +737,27 @@ export default function DashboardClient() {
         </div>
       </header>
 
-      {/* Account value bar */}
-      <AccountBar capital={capital} positions={positions} />
-
-      {/* Positions panel */}
-      <PositionsPanel positions={positions} />
+      {/* Account value bar + Positions — restricted for viewer */}
+      {role !== 'viewer' ? (
+        <>
+          <AccountBar capital={capital} positions={positions} />
+          <PositionsPanel positions={positions} />
+        </>
+      ) : (
+        <div style={{
+          margin: '6px 12px', padding: '10px 14px',
+          background: 'repeating-linear-gradient(135deg, rgba(255,0,60,0.03), rgba(255,0,60,0.03) 10px, transparent 10px, transparent 20px)',
+          border: '1px solid rgba(255,0,60,0.15)', borderRadius: '6px',
+          display: 'flex', alignItems: 'center', gap: '10px',
+        }}>
+          <span style={{ fontSize: '10px', fontWeight: 700, letterSpacing: '0.15em', color: 'rgba(255,0,60,0.6)', fontFamily: 'monospace' }}>
+            ⛔ RESTRICTED
+          </span>
+          <span style={{ fontSize: '9px', color: 'var(--text3)', fontFamily: 'monospace' }}>
+            // account_data + positions require elevated access
+          </span>
+        </div>
+      )}
 
       {/* Sort + filter bar */}
       <div style={{ borderBottom: '1px solid var(--border)', userSelect: 'none' }}>
