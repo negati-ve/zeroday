@@ -32,6 +32,15 @@ export interface DepthWall {
   defenseCount: number
 }
 
+export interface MetaRegimeData {
+  regime: 'ACCUMULATION' | 'MARKUP' | 'DISTRIBUTION' | 'MARKDOWN' | 'CHOP' | 'UNKNOWN'
+  confidence: number
+  avgCdZ: number
+  avgObi: number
+  divergenceScore: number
+  momentumSlope: number
+}
+
 export interface StockState {
   ltp: number
   signal: 'BULL' | 'BEAR' | 'NEUTRAL'
@@ -67,6 +76,9 @@ export interface StockState {
   squeezeConsec: number
   intradayHigh: number | null
   intradayLow: number | null
+  // Meta-regime classifiers (from computeMetaRegime / computeSessionMetaRegime)
+  metaRegime: MetaRegimeData | null
+  sessionRegime: MetaRegimeData | null
   // Technical indicators
   indicators: {
     emaShort: number | null
@@ -195,6 +207,8 @@ export function readStockState(): StockStateFile | null {
       indicators: null as StockState['indicators'],
       pat30v2: null as PatData | null,
       pat60_20: null as PatData | null,
+      metaRegime: null as MetaRegimeData | null,
+      sessionRegime: null as MetaRegimeData | null,
     }
     const stocks: Record<string, StockState> = {}
     for (const [name, data] of Object.entries(parsed.stocks)) {

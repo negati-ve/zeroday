@@ -4,6 +4,7 @@ import { useRouter } from 'next/navigation'
 import StockCard from '@/components/StockCard'
 import ThemeToggle from '@/components/ThemeToggle'
 import PositionsPanel from '@/components/PositionsPanel'
+import OrdersPanel from '@/components/OrdersPanel'
 import type { StockState, Position, CapitalData } from '@/lib/stockState'
 
 type StockEntry = StockState & { name: string }
@@ -696,6 +697,52 @@ export default function DashboardClient({ role = 'admin' }: { role?: string }) {
             CRUDE
           </a>
 
+          {role === 'admin' && (
+          <a
+            href="/dashboard/conviction-n50fut"
+            style={{
+              background: 'transparent',
+              border: '1px solid var(--border)',
+              borderRadius: '4px',
+              padding: '4px 10px',
+              color: 'var(--text2)',
+              fontSize: '11px',
+              fontFamily: 'inherit',
+              cursor: 'pointer',
+              letterSpacing: '0.05em',
+              textDecoration: 'none',
+              display: 'inline-flex',
+              alignItems: 'center',
+            }}
+            title="NIFTY50 Futures Conviction"
+          >
+            N50FUT
+          </a>
+          )}
+
+          {role === 'admin' && (
+          <a
+            href="/dashboard/conviction-bitcoin"
+            style={{
+              background: 'transparent',
+              border: '1px solid var(--border)',
+              borderRadius: '4px',
+              padding: '4px 10px',
+              color: 'var(--text2)',
+              fontSize: '11px',
+              fontFamily: 'inherit',
+              cursor: 'pointer',
+              letterSpacing: '0.05em',
+              textDecoration: 'none',
+              display: 'inline-flex',
+              alignItems: 'center',
+            }}
+            title="Bitcoin Conviction"
+          >
+            BTC
+          </a>
+          )}
+
           <a
             href="/dashboard/live"
             style={{
@@ -742,6 +789,7 @@ export default function DashboardClient({ role = 'admin' }: { role?: string }) {
         <>
           <AccountBar capital={capital} positions={positions} />
           <PositionsPanel positions={positions} />
+          {role === 'admin' && <OrdersPanel />}
         </>
       ) : (
         <div style={{
@@ -930,6 +978,7 @@ export default function DashboardClient({ role = 'admin' }: { role?: string }) {
                 stock={stock}
                 pinned={pinnedStocks.has(stock.name)}
                 onPin={() => togglePin(stock.name)}
+                role={role}
               />
             ))}
           </div>

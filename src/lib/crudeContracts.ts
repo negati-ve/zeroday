@@ -41,6 +41,7 @@ export interface CrudeOptionLive extends CrudeOption {
 
 export interface OIAnalytics {
   maxPainStrike: number
+  maxPainPull: number   // % pain increase at adjacent strikes vs min pain (higher = stronger magnet)
   pcr: number
   totalCallOI: number
   totalPutOI: number
@@ -195,7 +196,13 @@ export function getCrudeChain(spotEstimate: number, product: CrudeProduct = 'CRU
 }
 
 let oiCache: { data: OIAnalytics; ts: number; product: string } | null = null
-const OI_CACHE_TTL = 10_000
+const OI_CACHE_TTL = 30_000
+
+/** Synchronous read of the last successfully-fetched OI data — no API call. */
+export function getCachedCrudeOI(product: CrudeProduct): OIAnalytics | null {
+  return oiCache && Date.now() - oiCache.ts < OI_CACHE_TTL && oiCache.product === product
+    ? oiCache.data : null
+}
 
 export async function fetchChainOI(chain: CrudeChain): Promise<OIAnalytics | null> {
   if (oiCache && Date.now() - oiCache.ts < OI_CACHE_TTL && oiCache.product === chain.product) {
@@ -277,7 +284,21 @@ export async function fetchChainOI(chain: CrudeChain): Promise<OIAnalytics | nul
 
   const pcr = totalCallOI > 0 ? totalPutOI / totalCallOI : 0
 
-  const result: OIAnalytics = { maxPainStrike, pcr, totalCallOI, totalPutOI, strikes: strikeData }
+  // Pull strength: average % pain increase at the two strikes adjacent to max pain
+  // Higher = steeper pain gradient = stronger gravitational pull toward max pain
+  const mpIdx = strikeData.findIndex(s => s.strike === maxPainStrike)
+  let maxPainPull = 0
+  if (minPain > 0 && mpIdx >= 0) {
+    const neighbors: number[] = []
+    if (mpIdx > 0) neighbors.push(strikeData[mpIdx - 1].painAtStrike)
+    if (mpIdx < strikeData.length - 1) neighbors.push(strikeData[mpIdx + 1].painAtStrike)
+    if (neighbors.length > 0) {
+      const avgNeighborPain = neighbors.reduce((a, b) => a + b, 0) / neighbors.length
+      maxPainPull = Math.round((avgNeighborPain - minPain) / minPain * 100)
+    }
+  }
+
+  const result: OIAnalytics = { maxPainStrike, maxPainPull, pcr, totalCallOI, totalPutOI, strikes: strikeData }
   oiCache = { data: result, ts: Date.now(), product: chain.product }
   return result
 }

@@ -3,6 +3,7 @@ import path from 'path'
 import type { StockState, StockStateFile } from './stockState'
 import { readStockState } from './stockState'
 import { getISTHourMin, getNextTradingDay } from './tradingCalendar'
+import { kiteGetHistorical } from './kite'
 
 // ── NIFTY 50 Constituents (May 2026) ───────────────────────────────────────
 
@@ -83,6 +84,10 @@ interface Store {
   lastPersistTs: number
   sessionDay: string | null
   sessionPrices: Record<string, number>
+  ewPivots: EWPivot[]
+  lastEWTs: number
+  ewPivotsByTF: Partial<Record<string, EWPivot[]>>
+  lastEWTsByTF: Partial<Record<string, number>>
 }
 
 export interface N50Prediction {
@@ -151,6 +156,309 @@ export interface N50State {
   sysLog?: SysLogEntry[]
   niftySpot?: number
   heavyweights?: HeavyweightDetail[]
+  elliottWave?: ElliottWaveState | null
+  elliottWaveByTF?: Partial<Record<string, ElliottWaveState>>
+}
+
+// ── Elliott Wave Types ────────────────────────────────────────────────────────
+
+export interface EWPivot {
+  ts: number
+  price: number
+  type: 'H' | 'L'
+  wave: '?' | '0' | '1' | '2' | '3' | '4' | '5' | 'A' | 'B' | 'C'
+  timeStr: string
+}
+
+export interface EWLevel {
+  price: number
+  label: string
+  role: 'support' | 'resistance' | 'target'
+}
+
+export interface ElliottWaveState {
+  pattern: 'IMPULSE_BULL' | 'IMPULSE_BEAR' | 'CORRECTIVE_BULL' | 'CORRECTIVE_BEAR' | 'UNKNOWN'
+  currentWave: string
+  pivots: EWPivot[]
+  levels: EWLevel[]
+  primaryTarget: number | null
+  invalidation: number | null
+  confidence: number
+  combinedBias: 'STRONG_BULL' | 'BULL' | 'NEUTRAL' | 'BEAR' | 'STRONG_BEAR'
+  combinedNote: string
+  updatedAt: number
+}
+
+// ── Elliott Wave Algorithm ────────────────────────────────────────────────────
+
+interface EWCandle {
+  ts: number; open: number; high: number; low: number; close: number
+}
+
+function findZigZagPivots(candles: EWCandle[], minMovePct = 0.003): EWPivot[] {
+  const pivots: EWPivot[] = []
+  if (candles.length < 4) return pivots
+
+  const fmtTs = (ts: number) => {
+    const d = new Date(ts + 5.5 * 3600_000)
+    return `${String(d.getUTCHours()).padStart(2,'0')}:${String(d.getUTCMinutes()).padStart(2,'0')}`
+  }
+
+  let leg: 'UP' | 'DOWN' = candles[1].close >= candles[0].close ? 'UP' : 'DOWN'
+  let extPrice = leg === 'UP' ? candles[0].high : candles[0].low
+  let extTs = candles[0].ts
+
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i]
+    if (leg === 'UP') {
+      if (c.high > extPrice) { extPrice = c.high; extTs = c.ts }
+      if (c.close < extPrice * (1 - minMovePct)) {
+        pivots.push({ ts: extTs, price: extPrice, type: 'H', wave: '?', timeStr: fmtTs(extTs) })
+        leg = 'DOWN'; extPrice = c.low; extTs = c.ts
+      }
+    } else {
+      if (c.low < extPrice) { extPrice = c.low; extTs = c.ts }
+      if (c.close > extPrice * (1 + minMovePct)) {
+        pivots.push({ ts: extTs, price: extPrice, type: 'L', wave: '?', timeStr: fmtTs(extTs) })
+        leg = 'UP'; extPrice = c.high; extTs = c.ts
+      }
+    }
+  }
+  if (pivots.length > 0) {
+    const last = pivots[pivots.length - 1]
+    if (Math.abs(extPrice - last.price) / last.price > minMovePct * 0.4) {
+      pivots.push({ ts: extTs, price: extPrice, type: leg === 'UP' ? 'H' : 'L', wave: '?', timeStr: fmtTs(extTs) })
+    }
+  }
+  return pivots
+}
+
+function fibLevel(from: number, to: number, ratio: number): number {
+  return from + (to - from) * ratio
+}
+
+interface WaveFit {
+  pattern: ElliottWaveState['pattern']
+  currentWave: string
+  pivots: EWPivot[]
+  primaryTarget: number | null
+  invalidation: number | null
+  levels: EWLevel[]
+  score: number
+}
+
+type WaveLabel = EWPivot['wave']
+function applyLabels(pivots: EWPivot[], labels: string[]): EWPivot[] {
+  return pivots.map((p, i) => ({ ...p, wave: (labels[i] ?? '?') as WaveLabel }))
+}
+
+function buildImpulseLevels(p: EWPivot[], up: number, w1: number): EWLevel[] {
+  const levels: EWLevel[] = []
+  if (p.length >= 3) {
+    levels.push({ price: fibLevel(p[1].price, p[0].price, 0.382), label: '38.2% W2', role: 'support' })
+    levels.push({ price: fibLevel(p[1].price, p[0].price, 0.618), label: '61.8% W2', role: 'support' })
+  }
+  if (p.length >= 4) {
+    levels.push({ price: p[2].price + w1 * 1.618 * up, label: '1.618 W3', role: 'target' })
+    levels.push({ price: p[2].price + w1 * 2.618 * up, label: '2.618 W3', role: 'target' })
+  }
+  if (p.length >= 6) {
+    levels.push({ price: fibLevel(p[3].price, p[4].price, 0.382), label: '38.2% W4', role: 'support' })
+    levels.push({ price: p[4].price + w1 * up, label: 'W5=W1 tgt', role: 'target' })
+  }
+  return levels
+}
+
+function tryFitImpulse(seq: EWPivot[], bull: boolean): WaveFit | null {
+  const startType = bull ? 'L' : 'H'
+  if (seq[0].type !== startType) return null
+  if (seq.length < 3) return null
+
+  const up = bull ? 1 : -1
+  const p = seq
+
+  if (p[1].type === startType) return null
+  const w1 = (p[1].price - p[0].price) * up
+  if (w1 <= 0) return null
+
+  let score = 0
+  const labels: string[] = p.map((_,i) => i === 0 ? '0' : '?')
+  labels[1] = '1'
+
+  if (p.length < 3) return { pattern: bull ? 'IMPULSE_BULL' : 'IMPULSE_BEAR', currentWave: '2', pivots: applyLabels(p, labels), primaryTarget: null, invalidation: p[0].price, levels: [], score }
+
+  const w2_retrace = (p[1].price - p[2].price) * up / w1
+  if (w2_retrace <= 0 || w2_retrace >= 1.0) return null
+  labels[2] = '2'
+  if (w2_retrace >= 0.382 - 0.08 && w2_retrace <= 0.618 + 0.08) score += 1
+
+  if (p.length < 4) {
+    const w3start = p[2].price
+    const tgt = w3start + w1 * 1.618 * up
+    return { pattern: bull ? 'IMPULSE_BULL' : 'IMPULSE_BEAR', currentWave: '3', pivots: applyLabels(p, labels), primaryTarget: tgt, invalidation: p[0].price, levels: buildImpulseLevels(p, up, w1), score }
+  }
+
+  const w3 = (p[3].price - p[2].price) * up
+  if (p[3].type === startType) return null
+  if ((p[3].price - p[1].price) * up <= 0) return null
+  labels[3] = '3'
+  score += 1
+  const w1_w3_ratio = w3 / w1
+  if (w1_w3_ratio >= 1.4 && w1_w3_ratio <= 2.0) score += 1
+
+  if (p.length < 5) {
+    return { pattern: bull ? 'IMPULSE_BULL' : 'IMPULSE_BEAR', currentWave: '4', pivots: applyLabels(p, labels), primaryTarget: fibLevel(p[3].price, p[2].price, 0.382), invalidation: p[1].price, levels: buildImpulseLevels(p, up, w1), score }
+  }
+
+  const w4_retrace = (p[3].price - p[4].price) * up / w3
+  if (p[4].type !== startType) return null
+  if ((p[4].price - p[1].price) * up < 0) return null
+  labels[4] = '4'
+  if (w4_retrace >= 0.236 - 0.05 && w4_retrace <= 0.382 + 0.08) score += 1
+
+  if (p.length < 6) {
+    const w5tgt = p[4].price + w1 * up
+    return { pattern: bull ? 'IMPULSE_BULL' : 'IMPULSE_BEAR', currentWave: '5', pivots: applyLabels(p, labels), primaryTarget: w5tgt, invalidation: p[1].price, levels: buildImpulseLevels(p, up, w1), score }
+  }
+
+  if (p[5].type === startType) return null
+  labels[5] = '5'
+  score += 1
+  if (p.length > 6) labels[6] = 'A'
+  if (p.length > 7) labels[7] = 'B'
+  if (p.length > 8) labels[8] = 'C'
+
+  const isAfter5 = p.length > 6
+  const corrDir = bull ? 'CORRECTIVE_BEAR' : 'CORRECTIVE_BULL'
+  const cwv = p.length === 6 ? '5' : p.length === 7 ? 'A' : p.length === 8 ? 'B' : 'C'
+  return { pattern: isAfter5 ? corrDir as ElliottWaveState['pattern'] : bull ? 'IMPULSE_BULL' : 'IMPULSE_BEAR', currentWave: cwv, pivots: applyLabels(p, labels), primaryTarget: null, invalidation: p[1].price, levels: buildImpulseLevels(p, up, w1), score }
+}
+
+const NIFTY_EW_TF_CONFIG: Record<string, { kiteInterval: string; lookbackDays: number; refreshMs: number; zigzagThresh: number }> = {
+  '15m': { kiteInterval: '15minute', lookbackDays: 3,    refreshMs: 15*60_000,      zigzagThresh: 0.003 },
+  '1h':  { kiteInterval: '60minute', lookbackDays: 10,   refreshMs: 60*60_000,      zigzagThresh: 0.005 },
+  '4h':  { kiteInterval: '60minute', lookbackDays: 30,   refreshMs: 60*60_000,      zigzagThresh: 0.008 },
+  '1d':  { kiteInterval: 'day',      lookbackDays: 180,  refreshMs: 4*60*60_000,    zigzagThresh: 0.015 },
+  '1w':  { kiteInterval: 'week',     lookbackDays: 730,  refreshMs: 12*60*60_000,   zigzagThresh: 0.03  },
+  '1M':  { kiteInterval: 'month',    lookbackDays: 1825, refreshMs: 24*60*60_000,   zigzagThresh: 0.05  },
+}
+const NIFTY_TOKEN = 256265
+
+function resampleTo4H(candles: EWCandle[]): EWCandle[] {
+  const out: EWCandle[] = []
+  for (let i = 0; i < candles.length; i += 4) {
+    const chunk = candles.slice(i, Math.min(i + 4, candles.length))
+    if (chunk.length === 0) continue
+    out.push({
+      ts: chunk[0].ts,
+      open: chunk[0].open,
+      high: Math.max(...chunk.map(c => c.high)),
+      low: Math.min(...chunk.map(c => c.low)),
+      close: chunk[chunk.length - 1].close,
+    })
+  }
+  return out
+}
+
+async function fetchNiftyEWCandlesTF(tf: string, kiteInterval: string, lookbackDays: number): Promise<EWCandle[]> {
+  try {
+    const now = Date.now()
+    const istNow = new Date(now + 5.5 * 3600_000)
+    const from = new Date(istNow.getTime() - lookbackDays * 24 * 3600_000)
+    const fmt = (d: Date) => d.toISOString().slice(0, 10) + ' ' +
+      String(d.getUTCHours()).padStart(2,'0') + ':' + String(d.getUTCMinutes()).padStart(2,'0') + ':00'
+    const raw = await Promise.race([
+      kiteGetHistorical(NIFTY_TOKEN, kiteInterval as Parameters<typeof kiteGetHistorical>[1], fmt(from), fmt(istNow)),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('EW fetch timeout')), 15_000)),
+    ])
+    return raw.map(c => ({ ts: new Date(c.date).getTime(), open: c.open, high: c.high, low: c.low, close: c.close }))
+  } catch { return [] }
+}
+
+function computeElliottWave(
+  pivots: EWPivot[],
+  spot: number,
+  composite: { direction: string | null; bullProb: number; bearProb: number; confidence?: number }
+): ElliottWaveState {
+  const unknown: ElliottWaveState = {
+    pattern: 'UNKNOWN', currentWave: '?', pivots: pivots.slice(-6),
+    levels: [], primaryTarget: null, invalidation: null, confidence: 0,
+    combinedBias: 'NEUTRAL', combinedNote: 'Insufficient pivot data for wave analysis',
+    updatedAt: Date.now(),
+  }
+  if (pivots.length < 4) return unknown
+
+  const fits: WaveFit[] = []
+  for (let start = Math.max(0, pivots.length - 9); start <= pivots.length - 3; start++) {
+    const seq = pivots.slice(start)
+    const bf = tryFitImpulse(seq, true)
+    if (bf) fits.push(bf)
+    const bb = tryFitImpulse(seq, false)
+    if (bb) fits.push(bb)
+  }
+
+  if (fits.length === 0) return unknown
+
+  const best = fits.sort((a, b) => b.score - a.score)[0]
+  const confidence = Math.min(0.9, best.score / 5)
+
+  const orcDir = composite.direction
+  const orcConf = composite.confidence ?? 0
+  const wv = best.currentWave
+  const isBullImpulse = best.pattern === 'IMPULSE_BULL'
+  const isBearImpulse = best.pattern === 'IMPULSE_BEAR'
+  const isCorrectiveBear = best.pattern === 'CORRECTIVE_BEAR'
+  const isCorrectiveBull = best.pattern === 'CORRECTIVE_BULL'
+
+  let combinedBias: ElliottWaveState['combinedBias'] = 'NEUTRAL'
+  let combinedNote = ''
+
+  if (isBullImpulse && wv === '3') {
+    combinedBias = orcDir === 'BULL' ? 'STRONG_BULL' : 'BULL'
+    combinedNote = orcDir === 'BULL' ? 'Wave 3 impulse + oracle BULL — momentum phase, high conviction long' : 'Wave 3 impulse building — oracle diverges, watch for CD confirmation'
+  } else if (isBullImpulse && wv === '5') {
+    combinedBias = orcDir === 'BULL' ? 'BULL' : orcDir === 'BEAR' ? 'BEAR' : 'NEUTRAL'
+    combinedNote = orcDir === 'BEAR' ? 'Wave 5 terminal + oracle BEAR — exhaustion reversal setup' : 'Wave 5 in progress — target hit likely before reversal'
+  } else if (isBullImpulse && wv === '4') {
+    combinedBias = orcDir === 'BULL' ? 'BULL' : 'NEUTRAL'
+    combinedNote = 'Wave 4 correction — pullback in bull impulse, awaiting Wave 5 bounce'
+  } else if (isBullImpulse && wv === '2') {
+    combinedBias = orcDir === 'BEAR' ? 'BEAR' : 'NEUTRAL'
+    combinedNote = 'Wave 2 retracement — early bull impulse, oracle may flag short-term weakness'
+  } else if (isBearImpulse && wv === '3') {
+    combinedBias = orcDir === 'BEAR' ? 'STRONG_BEAR' : 'BEAR'
+    combinedNote = orcDir === 'BEAR' ? 'Wave 3 bear impulse + oracle BEAR — distribution phase, high conviction short' : 'Wave 3 bear impulse — oracle diverges, watch selling pressure in CD'
+  } else if (isBearImpulse && wv === '5') {
+    combinedBias = orcDir === 'BEAR' ? 'BEAR' : orcDir === 'BULL' ? 'BULL' : 'NEUTRAL'
+    combinedNote = orcDir === 'BULL' ? 'Wave 5 bear terminal + oracle BULL — potential bottom/reversal' : 'Wave 5 bear in progress — downside target near'
+  } else if (isBearImpulse && wv === '4') {
+    combinedBias = orcDir === 'BEAR' ? 'BEAR' : 'NEUTRAL'
+    combinedNote = 'Wave 4 bear correction — retracement in downtrend, Wave 5 lower likely'
+  } else if (isCorrectiveBear) {
+    combinedBias = orcDir === 'BEAR' ? 'BEAR' : 'NEUTRAL'
+    combinedNote = `ABC correction (${wv}) following bull impulse — watch for C-wave completion`
+  } else if (isCorrectiveBull) {
+    combinedBias = orcDir === 'BULL' ? 'BULL' : 'NEUTRAL'
+    combinedNote = `ABC correction (${wv}) following bear impulse — watch for C-wave completion`
+  } else {
+    combinedNote = `${best.pattern.replace('_', ' ').toLowerCase()} — wave ${wv} in progress`
+  }
+
+  if (orcConf > 0.4 && combinedBias === 'BULL') combinedBias = 'STRONG_BULL'
+  if (orcConf > 0.4 && combinedBias === 'BEAR') combinedBias = 'STRONG_BEAR'
+
+  return {
+    pattern: best.pattern,
+    currentWave: best.currentWave,
+    pivots: best.pivots.slice(-7),
+    levels: best.levels,
+    primaryTarget: best.primaryTarget,
+    invalidation: best.invalidation,
+    confidence,
+    combinedBias,
+    combinedNote,
+    updatedAt: Date.now(),
+  }
 }
 
 export interface HeavyweightDetail {
@@ -230,6 +538,10 @@ let store: Store = {
   lastPersistTs: 0,
   sessionDay: null,
   sessionPrices: {},
+  ewPivots: [],
+  lastEWTs: 0,
+  ewPivotsByTF: {},
+  lastEWTsByTF: {},
 }
 
 let loaded = false
@@ -1034,6 +1346,34 @@ export function getN50State(): N50State {
   }
   hwDetail.sort((a, b) => b.weight - a.weight)
 
+  // EW refresh — fire-and-forget, timestamps stamped before firing
+  const tfsToRefresh = Object.keys(NIFTY_EW_TF_CONFIG).filter(
+    tf => now - (store.lastEWTsByTF[tf] ?? 0) >= NIFTY_EW_TF_CONFIG[tf].refreshMs
+  )
+  if (tfsToRefresh.length > 0) {
+    for (const tf of tfsToRefresh) store.lastEWTsByTF[tf] = now
+    Promise.all(tfsToRefresh.map(async tf => {
+      const cfg = NIFTY_EW_TF_CONFIG[tf]
+      try {
+        let candles = await fetchNiftyEWCandlesTF(tf, cfg.kiteInterval, cfg.lookbackDays)
+        if (tf === '4h') candles = resampleTo4H(candles)
+        if (candles.length >= 5) {
+          store.ewPivotsByTF[tf] = findZigZagPivots(candles, cfg.zigzagThresh)
+          if (tf === '15m') store.ewPivots = store.ewPivotsByTF[tf]!
+        }
+      } catch { /* ignore */ }
+    })).catch(() => {})
+  }
+
+  const elliottWave = store.ewPivots.length >= 4 ? computeElliottWave(store.ewPivots, proxy, composite) : null
+  const elliottWaveByTF: Partial<Record<string, ElliottWaveState>> = {}
+  for (const tf of Object.keys(NIFTY_EW_TF_CONFIG)) {
+    const pivots = store.ewPivotsByTF[tf]
+    if (pivots && pivots.length >= 4) {
+      elliottWaveByTF[tf] = computeElliottWave(pivots, proxy, composite)
+    }
+  }
+
   return {
     prediction,
     technicals,
@@ -1048,6 +1388,8 @@ export function getN50State(): N50State {
     minutesAccumulated,
     dayPrediction: getDayPredictionState(),
     heavyweights: hwDetail,
+    elliottWave,
+    elliottWaveByTF,
   }
 }
 

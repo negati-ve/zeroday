@@ -87,7 +87,7 @@ export async function kiteGetPositions(): Promise<{ net: any[]; day: any[] }> {
 
 export async function kiteGetHistorical(
   instrumentToken: number,
-  interval: 'minute' | '3minute' | '5minute' | '15minute' | '60minute' | 'day',
+  interval: 'minute' | '3minute' | '5minute' | '15minute' | '60minute' | 'day' | 'week' | 'month',
   from: string,
   to: string,
 ): Promise<{ date: string; open: number; high: number; low: number; close: number; volume: number }[]> {
@@ -103,6 +103,86 @@ export async function kiteGetHistorical(
     close: c[4] as number,
     volume: c[5] as number,
   }))
+}
+
+export interface KiteOrder {
+  order_id: string
+  tradingsymbol: string
+  exchange: string
+  transaction_type: 'BUY' | 'SELL'
+  order_type: 'LIMIT' | 'MARKET' | 'SL' | 'SL-M'
+  quantity: number
+  pending_quantity: number
+  filled_quantity: number
+  price: number
+  trigger_price: number
+  average_price: number
+  status: string
+  status_message: string | null
+  product: string
+  validity: string
+  placed_by: string
+  order_timestamp: string
+}
+
+export async function kiteGetOrders(): Promise<KiteOrder[]> {
+  const res = await kiteGet(`${KITE_API_BASE}/orders`)
+  if (!res.ok) throw new Error(`Kite orders error: ${res.status}`)
+  const body = await res.json() as { data: KiteOrder[] }
+  return body.data ?? []
+}
+
+export async function kiteModifyOrder(orderId: string, params: {
+  order_type?: string
+  quantity?: number
+  price?: number
+  trigger_price?: number
+  validity?: string
+}): Promise<{ order_id: string }> {
+  const body = new URLSearchParams()
+  if (params.order_type)    body.set('order_type', params.order_type)
+  if (params.quantity)      body.set('quantity', String(params.quantity))
+  if (params.price != null) body.set('price', String(params.price))
+  if (params.trigger_price != null) body.set('trigger_price', String(params.trigger_price))
+  if (params.validity)      body.set('validity', params.validity)
+
+  let res = await fetch(`${KITE_API_BASE}/orders/regular/${orderId}`, {
+    method: 'PUT',
+    headers: { ...authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+    signal: AbortSignal.timeout(10_000),
+  })
+  if (res.status === 403) {
+    await res.text().catch(() => {})
+    res = await fetch(`${KITE_API_BASE}/orders/regular/${orderId}`, {
+      method: 'PUT',
+      headers: { ...authHeaders(true), 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+      signal: AbortSignal.timeout(10_000),
+    })
+  }
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.message ?? `Kite modify order failed: ${res.status}`)
+  return { order_id: data.data?.order_id ?? orderId }
+}
+
+export async function kiteCancelOrder(orderId: string): Promise<{ order_id: string }> {
+  let res = await fetch(`${KITE_API_BASE}/orders/regular/${orderId}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+    signal: AbortSignal.timeout(10_000),
+  })
+  if (res.status === 403) {
+    await res.text().catch(() => {})
+    res = await fetch(`${KITE_API_BASE}/orders/regular/${orderId}`, {
+      method: 'DELETE',
+      headers: authHeaders(true),
+      signal: AbortSignal.timeout(10_000),
+    })
+  }
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.message ?? `Kite cancel order failed: ${res.status}`)
+  return { order_id: data.data?.order_id ?? orderId }
 }
 
 export async function kitePlaceOrder(params: {

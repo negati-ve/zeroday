@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import { getN50State, updateSysLog, type N50State } from '@/lib/nifty50'
 import { kiteGetLTP } from '@/lib/kite'
-import { getNiftyContracts } from '@/lib/niftyContracts'
+import { getNiftyContracts, getCachedNiftyOI, type NiftyContracts, type NiftyOIAnalytics } from '@/lib/niftyContracts'
 import { processATTick, getATState, ensureATBackground } from '@/lib/autoTrader'
 
 ensureATBackground()
@@ -10,7 +10,7 @@ ensureATBackground()
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 
-let cache: { data: N50State & { niftySpot?: number }; ts: number } | null = null
+let cache: { data: N50State & { niftySpot?: number; contracts?: NiftyContracts; sysLog?: any[]; autoTrader?: any; oiAnalytics?: NiftyOIAnalytics }; ts: number } | null = null
 const CACHE_TTL = 5_000
 
 async function fetchNiftySpot(): Promise<number | undefined> {
@@ -42,7 +42,16 @@ export async function GET() {
       await processATTick(sysLog, contracts ?? null).catch(() => {})
     }
     const autoTrader = getATState()
-    const result = { ...state, niftySpot, contracts, sysLog, autoTrader }
+    const result: N50State & { niftySpot?: number; contracts?: NiftyContracts; sysLog?: any[]; autoTrader?: any; oiAnalytics?: NiftyOIAnalytics } = { ...state, niftySpot, contracts: contracts ?? undefined, sysLog, autoTrader }
+
+    // OI analytics: inject from synchronous cache first (always fast), then refresh in background
+    const cachedOI = getCachedNiftyOI()
+    if (cachedOI) result.oiAnalytics = cachedOI
+    if (contracts) {
+      const { fetchNiftyChainOI } = await import('@/lib/niftyContracts')
+      fetchNiftyChainOI(contracts).catch(() => {})
+    }
+
     cache = { data: result, ts: now }
     return NextResponse.json(result)
   } catch (err) {

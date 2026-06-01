@@ -2,7 +2,7 @@ import fs from 'fs'
 import path from 'path'
 import { IndicatorEngine, type IndicatorValues } from './indicators'
 import { kiteGetLTP, kiteGetQuote, kiteGetHistorical } from './kite'
-import { getNearestCrudeFuture, getCrudeChain, getCachedCrudeOI, fetchChainOI, type OIAnalytics, type CrudeChain, type CrudeProduct } from './crudeContracts'
+import { getNiftyContracts, fetchNiftyChainOI, getCachedNiftyOI, type NiftyOIAnalytics, type NiftyContracts } from './niftyContracts'
 import { getISTHourMin } from './tradingCalendar'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -28,23 +28,23 @@ const PERSIST_INTERVAL_MS = 5 * 60_000
 const SYSLOG_CYCLE_MS = 20 * 60_000
 const MAX_SYSLOG = 200
 const MAX_P20C_SWINGS = 100
-const TYPICAL_MOVE = 0.15
+const TYPICAL_MOVE = 0.1   // NIFTY typically moves 0.1% per 20m
 
 // ── V2 constants ──────────────────────────────────────────────────────────────
-const VEC_DIM_V2 = 15
-const MAX_PATTERNS_V2 = 300       // per session bucket (3 × 300 = 900 total)
-const MIN_PATTERNS_V2 = 3         // lower than V1 (10) — V2 uses detrended outcomes so fewer are needed
-const CUSUM_H = 0.006             // alarm threshold for CUSUM in Zeroday (6× 0.1% steps)
-const KALMAN_Q_PRICE = 0.5        // process noise: price (₹²/step)
-const KALMAN_Q_VEL   = 0.005      // process noise: velocity (₹²/step²)
-const KALMAN_R       = 1.0        // observation noise (₹²)
+const VEC_DIM_V2 = 14
+const MAX_PATTERNS_V2 = 300
+const MIN_PATTERNS_V2 = 3
+const CUSUM_H = 0.01             // NIFTY volatility is higher — wider threshold
+const KALMAN_Q_PRICE = 5.0       // NIFTY at ~24000 has 3× crude's absolute noise
+const KALMAN_Q_VEL   = 0.02
+const KALMAN_R       = 4.0
 const V2_PERSIST_INTERVAL_MS = 5 * 60_000
 
-// MCX trading hours: 9:00 AM - 11:30 PM IST
-const MCX_OPEN_HOUR = 9
-const MCX_OPEN_MIN = 0
-const MCX_CLOSE_HOUR = 23
-const MCX_CLOSE_MIN = 30
+// NSE trading hours: 9:15 AM – 3:30 PM IST
+const NSE_OPEN_HOUR  = 9
+const NSE_OPEN_MIN   = 15
+const NSE_CLOSE_HOUR = 15
+const NSE_CLOSE_MIN  = 30
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -55,7 +55,7 @@ interface Snapshot {
   proxy: number
 }
 
-interface CrudePattern {
+interface NiftyPattern {
   ts: number
   vec: number[]
   price: number
@@ -66,9 +66,9 @@ interface CrudePattern {
   sessionDay: string
 }
 
-interface CrudeStore {
+interface NiftyStore {
   snapshots: Snapshot[]
-  patterns: CrudePattern[]
+  patterns: NiftyPattern[]
   lastSnapshotTs: number
   lastPersistTs: number
   sessionDay: string | null
@@ -84,7 +84,7 @@ export interface HorizonPrediction {
   bearProb: number
 }
 
-export interface CrudePrediction {
+export interface NiftyPrediction {
   predictedMove: number
   bullProb: number
   bearProb: number
@@ -98,7 +98,7 @@ export interface CrudePrediction {
   h20: HorizonPrediction | null
 }
 
-export interface CrudeTechnicals {
+export interface NiftyTechnicals {
   rsi: number | null
   emaShort: number | null
   emaLong: number | null
@@ -111,12 +111,12 @@ export interface CrudeTechnicals {
   momentum5m: number
   sessionHigh: number
   sessionLow: number
-  rangePosition: number // 0 = at low, 1 = at high
+  rangePosition: number
   volume: number
   oi: number
 }
 
-export interface CrudeComposite {
+export interface NiftyComposite {
   predictedMove: number
   bullProb: number
   bearProb: number
@@ -149,14 +149,14 @@ export interface EWLevel {
 
 export interface ElliottWaveState {
   pattern: 'IMPULSE_BULL' | 'IMPULSE_BEAR' | 'CORRECTIVE_BULL' | 'CORRECTIVE_BEAR' | 'UNKNOWN'
-  currentWave: string                    // '1'–'5' or 'A'–'C' or '?'
-  pivots: EWPivot[]                      // last N significant pivots, labelled
-  levels: EWLevel[]                      // key fib support/resistance/targets
-  primaryTarget: number | null           // price target for completing current wave
-  invalidation: number | null            // price that breaks the count
-  confidence: number                     // 0–1
+  currentWave: string
+  pivots: EWPivot[]
+  levels: EWLevel[]
+  primaryTarget: number | null
+  invalidation: number | null
+  confidence: number
   combinedBias: 'STRONG_BULL' | 'BULL' | 'NEUTRAL' | 'BEAR' | 'STRONG_BEAR'
-  combinedNote: string                   // EW + oracle text interpretation
+  combinedNote: string
   updatedAt: number
 }
 
@@ -195,7 +195,6 @@ function findZigZagPivots(candles: EWCandle[], minMovePct = 0.003): EWPivot[] {
       }
     }
   }
-  // Add provisional last extreme if significant
   if (pivots.length > 0) {
     const last = pivots[pivots.length - 1]
     if (Math.abs(extPrice - last.price) / last.price > minMovePct * 0.4) {
@@ -220,15 +219,13 @@ interface WaveFit {
 }
 
 function tryFitImpulse(seq: EWPivot[], bull: boolean): WaveFit | null {
-  // Impulse needs alternating pivots starting with correct type
   const startType = bull ? 'L' : 'H'
   if (seq[0].type !== startType) return null
   if (seq.length < 3) return null
 
-  const up = bull ? 1 : -1  // +1 bull, -1 bear
+  const up = bull ? 1 : -1
   const p = seq
 
-  // Wave 1: p[0]→p[1]
   if (p[1].type === startType) return null
   const w1 = (p[1].price - p[0].price) * up
   if (w1 <= 0) return null
@@ -239,9 +236,8 @@ function tryFitImpulse(seq: EWPivot[], bull: boolean): WaveFit | null {
 
   if (p.length < 3) return { pattern: bull ? 'IMPULSE_BULL' : 'IMPULSE_BEAR', currentWave: '2', pivots: applyLabels(p, labels), primaryTarget: null, invalidation: p[0].price, levels: [], score }
 
-  // Wave 2: p[1]→p[2] — retrace of wave 1, must not exceed p[0]
   const w2_retrace = (p[1].price - p[2].price) * up / w1
-  if (w2_retrace <= 0 || w2_retrace >= 1.0) return null  // invalid retrace
+  if (w2_retrace <= 0 || w2_retrace >= 1.0) return null
   labels[2] = '2'
   if (w2_retrace >= 0.382 - 0.08 && w2_retrace <= 0.618 + 0.08) score += 1
 
@@ -251,23 +247,21 @@ function tryFitImpulse(seq: EWPivot[], bull: boolean): WaveFit | null {
     return { pattern: bull ? 'IMPULSE_BULL' : 'IMPULSE_BEAR', currentWave: '3', pivots: applyLabels(p, labels), primaryTarget: tgt, invalidation: p[0].price, levels: buildImpulseLevels(p, up, w1), score }
   }
 
-  // Wave 3: p[2]→p[3] — must exceed p[1]
   const w3 = (p[3].price - p[2].price) * up
   if (p[3].type === startType) return null
-  if ((p[3].price - p[1].price) * up <= 0) return null  // wave 3 must surpass wave 1
+  if ((p[3].price - p[1].price) * up <= 0) return null
   labels[3] = '3'
   score += 1
   const w1_w3_ratio = w3 / w1
-  if (w1_w3_ratio >= 1.4 && w1_w3_ratio <= 2.0) score += 1  // good 3 extension
+  if (w1_w3_ratio >= 1.4 && w1_w3_ratio <= 2.0) score += 1
 
   if (p.length < 5) {
     return { pattern: bull ? 'IMPULSE_BULL' : 'IMPULSE_BEAR', currentWave: '4', pivots: applyLabels(p, labels), primaryTarget: fibLevel(p[3].price, p[2].price, 0.382), invalidation: p[1].price, levels: buildImpulseLevels(p, up, w1), score }
   }
 
-  // Wave 4: p[3]→p[4] — must not overlap wave 1 top (p[4] direction doesn't cross p[1])
   const w4_retrace = (p[3].price - p[4].price) * up / w3
   if (p[4].type !== startType) return null
-  if ((p[4].price - p[1].price) * up < 0) return null  // wave 4 overlap — invalid
+  if ((p[4].price - p[1].price) * up < 0) return null
   labels[4] = '4'
   if (w4_retrace >= 0.236 - 0.05 && w4_retrace <= 0.382 + 0.08) score += 1
 
@@ -276,11 +270,9 @@ function tryFitImpulse(seq: EWPivot[], bull: boolean): WaveFit | null {
     return { pattern: bull ? 'IMPULSE_BULL' : 'IMPULSE_BEAR', currentWave: '5', pivots: applyLabels(p, labels), primaryTarget: w5tgt, invalidation: p[1].price, levels: buildImpulseLevels(p, up, w1), score }
   }
 
-  // Wave 5: p[4]→p[5]
   if (p[5].type === startType) return null
   labels[5] = '5'
   score += 1
-  // After 5: A-B-C correction
   if (p.length > 6) labels[6] = 'A'
   if (p.length > 7) labels[7] = 'B'
   if (p.length > 8) labels[8] = 'C'
@@ -353,15 +345,10 @@ async function fetchEWCandlesTF(token: number, kiteInterval: string, lookbackDay
   } catch { return [] }
 }
 
-// Keep existing function as alias for backward compat
-async function fetchEWCandles(token: number, product: CrudeProduct): Promise<EWCandle[]> {
-  return fetchEWCandlesTF(token, '15minute', 3)
-}
-
 function computeElliottWave(
   pivots: EWPivot[],
   spot: number,
-  composite: CrudeComposite
+  composite: NiftyComposite
 ): ElliottWaveState {
   const unknown: ElliottWaveState = {
     pattern: 'UNKNOWN', currentWave: '?', pivots: pivots.slice(-6),
@@ -371,7 +358,6 @@ function computeElliottWave(
   }
   if (pivots.length < 4) return unknown
 
-  // Try 5-wave fits starting from different recent windows
   const fits: WaveFit[] = []
   for (let start = Math.max(0, pivots.length - 9); start <= pivots.length - 3; start++) {
     const seq = pivots.slice(start)
@@ -386,7 +372,6 @@ function computeElliottWave(
   const best = fits.sort((a, b) => b.score - a.score)[0]
   const confidence = Math.min(0.9, best.score / 5)
 
-  // Combined oracle + EW bias
   const orcDir = composite.direction
   const orcConf = composite.confidence
   const wv = best.currentWave
@@ -429,7 +414,6 @@ function computeElliottWave(
     combinedNote = `${best.pattern.replace('_', ' ').toLowerCase()} — wave ${wv} in progress`
   }
 
-  // Upgrade STRONG if oracle confidence is high
   if (orcConf > 0.4 && combinedBias === 'BULL') combinedBias = 'STRONG_BULL'
   if (orcConf > 0.4 && combinedBias === 'BEAR') combinedBias = 'STRONG_BEAR'
 
@@ -447,20 +431,18 @@ function computeElliottWave(
   }
 }
 
-// ── One segment that hit its target before extension ──────────────────────────
+// ── SysLog types ──────────────────────────────────────────────────────────────
 
-// One segment that hit its target before extension
 export interface SysLogExtend {
   ts: number
   cycleTime: string
-  spotAtExtend: number   // spot baseline for this segment
-  prevPredMove: number   // the move% that was just satisfied
-  // optEntry/optTarget removed from sub-rows — cumulative P&L shown on main row only
+  spotAtExtend: number
+  prevPredMove: number
   optEntry?: number | null
   optTarget?: number | null
 }
 
-export interface CrudeSysLogEntry {
+export interface NiftySysLogEntry {
   cycleTs: number
   cycleTime: string
   predMove: number
@@ -481,16 +463,14 @@ export interface CrudeSysLogEntry {
   targetHitTs?: number | null
   liveMove?: number | null
   liveSpot?: number | null
-  // Recommended option contract at time of signal
   optStrike?: number | null
   optType?: 'CE' | 'PE' | null
   optSymbol?: string | null
-  optEntry?: number | null    // option ask price at signal time
-  optTarget?: number | null   // estimated option price at predicted underlying target
-  // Same-direction extension (target hit and composite still aligned)
-  repeatCount?: number          // 1 = first trigger only; 2+ = extended
-  extends?: SysLogExtend[]      // prior hit segments (length === repeatCount - 1)
-  originalOptEntry?: number | null  // option LTP at chain start (for cumulative P&L)
+  optEntry?: number | null
+  optTarget?: number | null
+  repeatCount?: number
+  extends?: SysLogExtend[]
+  originalOptEntry?: number | null
 }
 
 // ── P20C Swing Log ────────────────────────────────────────────────────────────
@@ -500,7 +480,7 @@ export interface P20CSwingEntry {
   startTs: number
   startTime: string
   direction: 'BULL' | 'BEAR'
-  scaledAtStart: number     // pat20con scaled (-1..+1) at open
+  scaledAtStart: number
   spotAtStart: number
   sessionDay: string
   optStrike: number | null
@@ -513,24 +493,24 @@ export interface P20CSwingEntry {
   scaledAtEnd: number | null
   spotAtEnd: number | null
   durationMin: number | null
-  outcomeMove: number | null  // % spot move entry→exit
+  outcomeMove: number | null
   correct: boolean | null
   optExit: number | null
   pnlGross: number | null
   pnlNet: number | null
 }
 
-// ── Pat20Con: rolling probability density signal (internal) ──────────────────
+// ── Pat20Con ─────────────────────────────────────────────────────────────────
 
 interface P20CEntry { ts: number; bullProb: number }
 
 export interface Pat20Con {
-  smoothed: number      // Gaussian KDE smoothed bull probability
-  effective: number     // velocity-boosted effective probability
-  velocity: number      // dP/dt per minute (positive = building bull)
-  acceleration: number  // d²P/dt² per minute
+  smoothed: number
+  effective: number
+  velocity: number
+  acceleration: number
   direction: 'BULL' | 'BEAR' | null
-  strength: number      // 0-1 conviction magnitude
+  strength: number
 }
 
 function computePat20Con(buf: P20CEntry[], now: number): Pat20Con | null {
@@ -551,10 +531,10 @@ function computePat20Con(buf: P20CEntry[], now: number): Pat20Con | null {
   const s2 = kde(now - 2 * 60_000)
   const s4 = kde(now - 4 * 60_000)
 
-  const v0 = (s0 - s2) / 2                     // per-minute velocity at now
-  const v2 = (s2 - s4) / 2                     // per-minute velocity at t-2m
+  const v0 = (s0 - s2) / 2
+  const v2 = (s2 - s4) / 2
   const acc = v0 - v2
-  const vc  = Math.max(-0.05, Math.min(0.05, v0))  // clamped velocity
+  const vc  = Math.max(-0.05, Math.min(0.05, v0))
   const eff = Math.max(0, Math.min(1, s0 + vc * P20C_VEL_BOOST))
 
   return {
@@ -567,28 +547,96 @@ function computePat20Con(buf: P20CEntry[], now: number): Pat20Con | null {
   }
 }
 
-export interface CrudeState {
-  prediction: CrudePrediction
-  technicals: CrudeTechnicals
-  composite: CrudeComposite
+// ── NiftyChain (compatible with CrudeChain shape for UI reuse) ────────────────
+
+export interface NiftyFutChain {
+  calls: { tradingsymbol: string; strike: number; expiry: string; instrumentType: 'CE'; product: string }[]
+  puts: { tradingsymbol: string; strike: number; expiry: string; instrumentType: 'PE'; product: string }[]
+  spotEstimate: number
+  expiry: string
+  product: string
+  lotSize: number
+  strikeStep: number
+  atmStrike: number
+  oiAnalytics?: NiftyOIAnalytics
+}
+
+export interface NiftyFlowState {
+  cumDelta:        number
+  cdZScore:        number
+  aggressionRatio: number
+  cusumPos:        number
+  cusumNeg:        number
+  cusumAlarm:      'BULL' | 'BEAR' | null
+}
+
+// ── V2 types ──────────────────────────────────────────────────────────────────
+
+export type NSESession = 'morning' | 'afternoon' | 'evening'
+
+interface PatternV2 {
+  ts: number
+  vec: number[]
+  price: number
+  sessionKey: NSESession
+  sessionDay: string
+  outcome5:  number | null
+  outcome15: number | null
+  outcome20: number | null
+  detrended5:  number | null
+  detrended15: number | null
+  detrended20: number | null
+}
+
+interface KalmanState {
+  x: [number, number]
+  P: [[number, number], [number, number]]
+  initialised: boolean
+}
+
+export interface NiftyV2 {
+  prediction:          NiftyPrediction
+  sessionKey:          NSESession
+  sessionPatternCount: number
+  flowState:           NiftyFlowState | null
+  featureVec:          number[]
+  kalmanVelocity:      number
+}
+
+// ── Meta-Regime types ─────────────────────────────────────────────────────────
+
+export interface MetaRegimeData {
+  regime: 'ACCUMULATION' | 'MARKUP' | 'DISTRIBUTION' | 'MARKDOWN' | 'CHOP' | 'UNKNOWN'
+  confidence: number
+  avgCdZ: number
+  avgObi: number
+  divergenceScore: number
+  momentumSlope: number
+}
+
+// ── Main NiftyFutState export type ────────────────────────────────────────────
+
+export interface NiftyFutState {
+  prediction: NiftyPrediction
+  technicals: NiftyTechnicals
+  composite: NiftyComposite
   snapshotCount: number
   patternCount: number
   resolvedCount: number
   proxy: number
   minutesAccumulated: number
-  sysLog: CrudeSysLogEntry[]
-  chain: CrudeChain | null
+  sysLog: NiftySysLogEntry[]
+  chain: NiftyFutChain | null
   spot: number
   futureSymbol: string
   futureToken: number
-  product: CrudeProduct
   marketOpen: boolean
   pat20Con: Pat20Con | null
   p20cSysLog: P20CSwingEntry[]
   elliottWave: ElliottWaveState | null
   elliottWaveByTF: Partial<Record<string, ElliottWaveState>>
   metaRegime: MetaRegimeData | null
-  v2: CrudeV2 | null
+  v2: NiftyV2 | null
   depth?: {
     buy: { price: number; quantity: number; orders: number }[]
     sell: { price: number; quantity: number; orders: number }[]
@@ -597,7 +645,7 @@ export interface CrudeState {
 
 // ── Singleton State ───────────────────────────────────────────────────────────
 
-function freshStore(): CrudeStore {
+function freshStore(): NiftyStore {
   return {
     snapshots: [],
     patterns: [],
@@ -611,44 +659,43 @@ function freshStore(): CrudeStore {
   }
 }
 
-// Per-product state to prevent cross-contamination
 interface ProductState {
-  store: CrudeStore
+  store: NiftyStore
   indicatorEngine: IndicatorEngine
   engineWarmed: boolean
   warmingPromise: Promise<void> | null
   loaded: boolean
   lastWarmTs: number
-  sysLogStore: { entries: CrudeSysLogEntry[]; lastCycleTs: number }
+  sysLogStore: { entries: NiftySysLogEntry[]; lastCycleTs: number }
   sysLogLoaded: boolean
   p20cBuf: P20CEntry[]
   p20cLastTs: number
   p20cBufLoaded: boolean
   p20cBufLastPersistTs: number
-  lastOIAnalytics: OIAnalytics | null
+  lastOIAnalytics: NiftyOIAnalytics | null
   p20cSwingStore: { entries: P20CSwingEntry[]; nextId: number }
   p20cSwingLoaded: boolean
   ewPivots: EWPivot[]
   lastEWTs: number
   ewPivotsByTF: Partial<Record<string, EWPivot[]>>
   lastEWTsByTF: Partial<Record<string, number>>
-  // V2 system
   patternsV2: { morning: PatternV2[]; afternoon: PatternV2[]; evening: PatternV2[] }
   patternsV2Loaded: boolean
   patternsV2LastPersistTs: number
   lastV2SnapshotTs: number
   kalman: KalmanState
   kalmanLastTs: number
-  lastFlowState: CrudeFlowState | null
+  lastFlowState: NiftyFlowState | null
   lastFlowStateAt: number
+  instrumentToken: number
 }
 
-const productStates = new Map<CrudeProduct, ProductState>()
+// Single product state for NIFTY (no Map needed)
+let _niftyProductState: ProductState | null = null
 
-function getProductState(product: CrudeProduct): ProductState {
-  let ps = productStates.get(product)
-  if (!ps) {
-    ps = {
+function getNiftyProductState(): ProductState {
+  if (!_niftyProductState) {
+    _niftyProductState = {
       store: freshStore(),
       indicatorEngine: new IndicatorEngine({ emaShortPeriod: 9, emaLongPeriod: 21, rsiPeriod: 14, atrPeriod: 14 }),
       engineWarmed: false,
@@ -676,30 +723,43 @@ function getProductState(product: CrudeProduct): ProductState {
       kalmanLastTs: 0,
       lastFlowState: null,
       lastFlowStateAt: 0,
+      instrumentToken: 0,
     }
-    productStates.set(product, ps)
   }
-  return ps
+  return _niftyProductState
 }
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 
-function patternFileFor(product: CrudeProduct): string {
-  return path.join('/workspace/option-trader', `crude-${product.toLowerCase()}-patterns.json`)
+const BASE_DIR = '/workspace/option-trader'
+
+function patternFile(): string {
+  return path.join(BASE_DIR, 'niftyfut-patterns.json')
 }
 
-function sysLogFileFor(product: CrudeProduct): string {
-  return path.join('/workspace/option-trader', `crude-${product.toLowerCase()}-syslog.json`)
+function sysLogFile(): string {
+  return path.join(BASE_DIR, 'niftyfut-syslog.json')
 }
 
-function ensureLoaded(ps: ProductState, product: CrudeProduct) {
+function p20cBufFile(): string {
+  return path.join(BASE_DIR, 'niftyfut-p20cbuf.json')
+}
+
+function p20cSwingFile(): string {
+  return path.join(BASE_DIR, 'niftyfut-p20csyslog.json')
+}
+
+function patternsV2File(sessionKey: NSESession): string {
+  return path.join(BASE_DIR, `niftyfut-v2-${sessionKey}.json`)
+}
+
+function ensureLoaded(ps: ProductState) {
   if (ps.loaded) return
   ps.loaded = true
   try {
-    const raw = fs.readFileSync(patternFileFor(product), 'utf8')
-    const saved = JSON.parse(raw) as { patterns?: CrudePattern[] }
+    const raw = fs.readFileSync(patternFile(), 'utf8')
+    const saved = JSON.parse(raw) as { patterns?: NiftyPattern[] }
     if (Array.isArray(saved.patterns)) {
-      // Drop old 8-dim patterns — feature semantics changed (depth dims 0-3 added)
       ps.store.patterns = saved.patterns
         .filter(p => Array.isArray(p.vec) && p.vec.length >= 12)
         .slice(-MAX_PATTERNS)
@@ -713,9 +773,9 @@ function ensureLoaded(ps: ProductState, product: CrudeProduct) {
   } catch { /* no file yet */ }
 }
 
-function persist(ps: ProductState, product: CrudeProduct) {
+function persist(ps: ProductState) {
   try {
-    fs.writeFileSync(patternFileFor(product), JSON.stringify({
+    fs.writeFileSync(patternFile(), JSON.stringify({
       patterns: ps.store.patterns.slice(-MAX_PATTERNS),
       savedAt: Date.now(),
     }))
@@ -723,14 +783,13 @@ function persist(ps: ProductState, product: CrudeProduct) {
   } catch { /* ignore */ }
 }
 
-function ensureSysLogLoaded(ps: ProductState, product: CrudeProduct) {
+function ensureSysLogLoaded(ps: ProductState) {
   if (ps.sysLogLoaded) return
   ps.sysLogLoaded = true
   try {
-    const raw = fs.readFileSync(sysLogFileFor(product), 'utf8')
+    const raw = fs.readFileSync(sysLogFile(), 'utf8')
     const saved = JSON.parse(raw) as Partial<typeof ps.sysLogStore>
     if (Array.isArray(saved.entries)) {
-      // Deduplicate by cycleTs in case concurrent writes produced duplicate entries
       const seen = new Set<number>()
       ps.sysLogStore.entries = saved.entries.filter((e: { cycleTs: number }) => {
         if (seen.has(e.cycleTs)) return false
@@ -742,9 +801,9 @@ function ensureSysLogLoaded(ps: ProductState, product: CrudeProduct) {
   } catch { /* no file yet */ }
 }
 
-function persistSysLog(ps: ProductState, product: CrudeProduct) {
+function persistSysLog(ps: ProductState) {
   try {
-    fs.writeFileSync(sysLogFileFor(product), JSON.stringify({
+    fs.writeFileSync(sysLogFile(), JSON.stringify({
       entries: ps.sysLogStore.entries.slice(-MAX_SYSLOG),
       lastCycleTs: ps.sysLogStore.lastCycleTs,
       savedAt: Date.now(),
@@ -752,18 +811,13 @@ function persistSysLog(ps: ProductState, product: CrudeProduct) {
   } catch { /* ignore */ }
 }
 
-function p20cBufFileFor(product: CrudeProduct): string {
-  return path.join('/workspace/option-trader', `crude-${product.toLowerCase()}-p20cbuf.json`)
-}
-
-function ensureP20CBufLoaded(ps: ProductState, product: CrudeProduct) {
+function ensureP20CBufLoaded(ps: ProductState) {
   if (ps.p20cBufLoaded) return
   ps.p20cBufLoaded = true
   try {
-    const raw = fs.readFileSync(p20cBufFileFor(product), 'utf8')
+    const raw = fs.readFileSync(p20cBufFile(), 'utf8')
     const saved = JSON.parse(raw) as { buf?: P20CEntry[]; lastTs?: number }
     if (Array.isArray(saved.buf)) {
-      // Only restore entries within the last P20C_WIN_MS window — stale entries skew KDE
       const cutoff = Date.now() - P20C_WIN_MS
       ps.p20cBuf = saved.buf.filter(e => e.ts >= cutoff).slice(-P20C_BUF_MAX)
       if (saved.lastTs) ps.p20cLastTs = saved.lastTs
@@ -771,9 +825,9 @@ function ensureP20CBufLoaded(ps: ProductState, product: CrudeProduct) {
   } catch { /* no file yet */ }
 }
 
-function persistP20CBuf(ps: ProductState, product: CrudeProduct) {
+function persistP20CBuf(ps: ProductState) {
   try {
-    fs.writeFileSync(p20cBufFileFor(product), JSON.stringify({
+    fs.writeFileSync(p20cBufFile(), JSON.stringify({
       buf: ps.p20cBuf,
       lastTs: ps.p20cLastTs,
       savedAt: Date.now(),
@@ -808,17 +862,17 @@ async function warmIndicators(ps: ProductState, instrumentToken: number) {
       ps.lastWarmTs = now
     }
   } catch (err) {
-    console.error('[crudeOil] warm indicators failed:', err instanceof Error ? err.message : err)
+    console.error('[niftyFut] warm indicators failed:', err instanceof Error ? err.message : err)
   }
 }
 
 // ── Depth Features ───────────────────────────────────────────────────────────
 
 interface DepthFeatures {
-  obi: number          // order book imbalance [-1, +1]
-  mpEdgeTicks: number  // microprice edge in ticks
-  depthAsymm: number   // total depth asymmetry [-1, +1]
-  qpoBalance: number   // qty-per-order balance [-1, +1]
+  obi: number
+  mpEdgeTicks: number
+  depthAsymm: number
+  qpoBalance: number
 }
 
 function computeDepthFeatures(depth: { buy: { price: number; quantity: number; orders: number }[]; sell: { price: number; quantity: number; orders: number }[] }): DepthFeatures {
@@ -829,13 +883,11 @@ function computeDepthFeatures(depth: { buy: { price: number; quantity: number; o
     return { obi: 0, mpEdgeTicks: 0, depthAsymm: 0, qpoBalance: 0 }
   }
 
-  // OBI — sum of qty across all levels
   const bidQty = bids.reduce((s, l) => s + l.quantity, 0)
   const askQty = asks.reduce((s, l) => s + l.quantity, 0)
   const totalQty = bidQty + askQty
   const obi = totalQty > 0 ? (bidQty - askQty) / totalQty : 0
 
-  // Microprice edge — pressure-weighted fair price vs mid
   const bestBid = bids[0], bestAsk = asks[0]
   const mid = (bestBid.price + bestAsk.price) / 2
   const microPrice = (bestAsk.price * bestBid.quantity + bestBid.price * bestAsk.quantity)
@@ -843,10 +895,8 @@ function computeDepthFeatures(depth: { buy: { price: number; quantity: number; o
   const tickSize = bestAsk.price - bestBid.price || 1
   const mpEdgeTicks = (microPrice - mid) / tickSize
 
-  // Depth asymmetry — total bid vs ask depth (all levels)
   const depthAsymm = totalQty > 0 ? (bidQty - askQty) / totalQty : 0
 
-  // QPO balance — qty per order, institutional signal
   const bidQpo = bestBid.orders > 0 ? bestBid.quantity / bestBid.orders : 0
   const askQpo = bestAsk.orders > 0 ? bestAsk.quantity / bestAsk.orders : 0
   const qpoSum = bidQpo + askQpo
@@ -855,25 +905,12 @@ function computeDepthFeatures(depth: { buy: { price: number; quantity: number; o
   return { obi, mpEdgeTicks, depthAsymm, qpoBalance }
 }
 
-// ── Feature Vector (12-dim, matches NSE pat60 Q/K/V architecture) ────────────
-//
-//  0  OBI              order book imbalance (depth)
-//  1  mpEdge           microprice edge in ticks (depth)
-//  2  depthAsymm       bid/ask total depth asymmetry (depth)
-//  3  qpoBalance       qty-per-order balance (depth, institutional signal)
-//  4  momentum1m       1-min price return
-//  5  momentum5m       5-min price return
-//  6  RSI              relative strength index, centered
-//  7  EMA crossover    9/21 EMA alignment
-//  8  VWAP alignment   price vs VWAP
-//  9  range position   position within session range
-// 10  ATR%             volatility normalized
-// 11  OI momentum      open interest change signal (reserved)
+// ── Feature Vector (12-dim) ───────────────────────────────────────────────────
 
 function buildFeatureVector(
   price: number,
   ind: IndicatorValues,
-  tech: CrudeTechnicals,
+  tech: NiftyTechnicals,
   depth?: { buy: { price: number; quantity: number; orders: number }[]; sell: { price: number; quantity: number; orders: number }[] },
 ): number[] {
   const c = (v: number, scale = 1) =>
@@ -882,81 +919,24 @@ function buildFeatureVector(
   const df = depth ? computeDepthFeatures(depth) : { obi: 0, mpEdgeTicks: 0, depthAsymm: 0, qpoBalance: 0 }
 
   return [
-    c(df.obi),                                                // 0: OBI
-    c(df.mpEdgeTicks, 0.5),                                    // 1: mpEdge ±2 ticks → ±1
-    c(df.depthAsymm),                                          // 2: depth asymmetry
-    c(df.qpoBalance),                                          // 3: QPO balance
-    c(tech.momentum1m, 200),                                   // 4: 1-min mom ±0.5% → ±1
-    c(tech.momentum5m, 100),                                   // 5: 5-min mom ±1% → ±1
-    c(ind.rsi != null ? (ind.rsi - 50) / 50 : 0),             // 6: RSI centered
-    c(tech.emaCrossover === 'BULL' ? 1 : tech.emaCrossover === 'BEAR' ? -1 : 0), // 7: EMA
-    c(tech.vwapAlign === 'BULL' ? 1 : tech.vwapAlign === 'BEAR' ? -1 : 0),       // 8: VWAP
-    c(tech.rangePosition * 2 - 1),                             // 9: range pos 0-1 → -1..+1
-    c(ind.atrPct != null ? (ind.atrPct - 0.3) / 0.3 : 0),    // 10: ATR% normalized
-    0,                                                          // 11: reserved (OI momentum)
+    c(df.obi),
+    c(df.mpEdgeTicks, 0.5),
+    c(df.depthAsymm),
+    c(df.qpoBalance),
+    c(tech.momentum1m, 200),
+    c(tech.momentum5m, 100),
+    c(ind.rsi != null ? (ind.rsi - 50) / 50 : 0),
+    c(tech.emaCrossover === 'BULL' ? 1 : tech.emaCrossover === 'BEAR' ? -1 : 0),
+    c(tech.vwapAlign === 'BULL' ? 1 : tech.vwapAlign === 'BEAR' ? -1 : 0),
+    c(tech.rangePosition * 2 - 1),
+    c(ind.atrPct != null ? (ind.atrPct - 0.3) / 0.3 : 0),
+    0,
   ]
 }
 
 // ── Meta-Regime Classifier ────────────────────────────────────────────────────
-// Crude feature vector dims used:
-//   dim[0] = OBI           (same as stock)
-//   dim[5] = 5m momentum   (CDZ proxy — normalized −1..+1)
-//   dim[4] = 1m momentum   (momentum slope)
-//   dim[9] = range pos     (VA position proxy, −1..+1)
-// Outcome: outcome20 (> 0 = BULL, < 0 = BEAR)
 
-export interface MetaRegimeData {
-  regime: 'ACCUMULATION' | 'MARKUP' | 'DISTRIBUTION' | 'MARKDOWN' | 'CHOP' | 'UNKNOWN'
-  confidence: number
-  avgCdZ: number
-  avgObi: number
-  divergenceScore: number
-  momentumSlope: number
-}
-
-// ── V2 types ──────────────────────────────────────────────────────────────────
-
-export type MCXSession = 'morning' | 'afternoon' | 'evening'
-
-interface PatternV2 {
-  ts: number
-  vec: number[]        // 14-dim
-  price: number
-  sessionKey: MCXSession
-  sessionDay: string
-  outcome5:  number | null
-  outcome15: number | null
-  outcome20: number | null
-  detrended5:  number | null
-  detrended15: number | null
-  detrended20: number | null
-}
-
-interface KalmanState {
-  x: [number, number]                    // [price, velocity]
-  P: [[number, number], [number, number]] // 2×2 covariance
-  initialised: boolean
-}
-
-export interface CrudeFlowState {
-  cumDelta:        number
-  cdZScore:        number
-  aggressionRatio: number
-  cusumPos:        number
-  cusumNeg:        number
-  cusumAlarm:      'BULL' | 'BEAR' | null
-}
-
-export interface CrudeV2 {
-  prediction:          CrudePrediction        // same interface as existing
-  sessionKey:          MCXSession
-  sessionPatternCount: number
-  flowState:           CrudeFlowState | null
-  featureVec:          number[]
-  kalmanVelocity:      number                 // ₹/min — expected drift
-}
-
-function _crudeLinSlope(ys: number[]): number {
+function _linSlope(ys: number[]): number {
   const n = ys.length
   if (n < 2) return 0
   const meanX = (n - 1) / 2
@@ -969,19 +949,18 @@ function _crudeLinSlope(ys: number[]): number {
   return den > 0 ? num / den : 0
 }
 
-export function computeCrudeMetaRegime(patterns: CrudePattern[], n = 60): MetaRegimeData {
+export function computeNiftyMetaRegime(patterns: NiftyPattern[], n = 60): MetaRegimeData {
   const slice = patterns.slice(-n)
   if (slice.length < 5) return { regime: 'UNKNOWN', confidence: 0, avgCdZ: 0, avgObi: 0, divergenceScore: 0, momentumSlope: 0 }
 
-  const cdZVals  = slice.map(p => p.vec[5] ?? 0)   // 5m momentum as CDZ proxy
-  const obiVals  = slice.map(p => p.vec[0] ?? 0)   // OBI
-  const momVals  = slice.map(p => p.vec[4] ?? 0)   // 1m momentum for slope
+  const cdZVals  = slice.map(p => p.vec[5] ?? 0)
+  const obiVals  = slice.map(p => p.vec[0] ?? 0)
+  const momVals  = slice.map(p => p.vec[4] ?? 0)
 
   const avgCdZ = cdZVals.reduce((a, b) => a + b, 0) / slice.length
   const avgObi = obiVals.reduce((a, b) => a + b, 0) / slice.length
-  const momentumSlope = _crudeLinSlope(momVals)
+  const momentumSlope = _linSlope(momVals)
 
-  // Divergence: fraction where sign(cdZ) ≠ sign(obi) and |cdZ| > threshold
   const cdZThresh = 0.15
   let divergenceCount = 0
   for (let i = 0; i < slice.length; i++) {
@@ -990,7 +969,6 @@ export function computeCrudeMetaRegime(patterns: CrudePattern[], n = 60): MetaRe
   }
   const divergenceScore = divergenceCount / slice.length
 
-  // Outcome bias (from resolved patterns)
   const resolved = slice.filter(p => p.outcome20 !== null)
   let bullBias = 0.5, bearBias = 0.5
   if (resolved.length > 0) {
@@ -998,7 +976,6 @@ export function computeCrudeMetaRegime(patterns: CrudePattern[], n = 60): MetaRe
     bearBias = 1 - bullBias
   }
 
-  // Regime classification (same thresholds as CLAUDE.md GT section, scaled for momentum proxy)
   const cdBull = avgCdZ > 0.15
   const cdBear = avgCdZ < -0.15
   const obiBull = avgObi > 0.12
@@ -1018,17 +995,16 @@ export function computeCrudeMetaRegime(patterns: CrudePattern[], n = 60): MetaRe
   return { regime, confidence, avgCdZ, avgObi, divergenceScore, momentumSlope }
 }
 
-// ── MCX Session classifier ────────────────────────────────────────────────────
+// ── NSE Session classifier ────────────────────────────────────────────────────
 
-export function getMCXSession(istHour: number, istMinute: number): MCXSession {
+export function getNSESession(istHour: number, istMinute: number): NSESession {
   const mins = istHour * 60 + istMinute
-  if (mins < 14 * 60) return 'morning'
-  if (mins < 18 * 60) return 'afternoon'
+  if (mins < 12 * 60) return 'morning'
+  if (mins < 14 * 60) return 'afternoon'
   return 'evening'
 }
 
 // ── Kalman filter (constant-velocity model) ───────────────────────────────────
-// State: [price, velocity_per_minute]. Updates every time getCrudeState is called.
 
 function kalmanUpdate(ks: KalmanState, price: number, dtMinutes: number): void {
   if (!ks.initialised) {
@@ -1037,9 +1013,8 @@ function kalmanUpdate(ks: KalmanState, price: number, dtMinutes: number): void {
     ks.initialised = true
     return
   }
-  const dt = Math.max(0.016, Math.min(dtMinutes, 10))  // clamp to [1s, 10min]
+  const dt = Math.max(0.016, Math.min(dtMinutes, 10))
 
-  // Predict
   const xp0 = ks.x[0] + ks.x[1] * dt
   const xp1 = ks.x[1]
   const P00 = ks.P[0][0] + dt * (ks.P[0][1] + ks.P[1][0]) + dt * dt * ks.P[1][1] + KALMAN_Q_PRICE
@@ -1047,7 +1022,6 @@ function kalmanUpdate(ks: KalmanState, price: number, dtMinutes: number): void {
   const P10 = ks.P[1][0] + dt * ks.P[1][1]
   const P11 = ks.P[1][1] + KALMAN_Q_VEL
 
-  // Update (H = [1, 0])
   const S = P00 + KALMAN_R
   const K0 = P00 / S
   const K1 = P10 / S
@@ -1065,17 +1039,16 @@ function kalmanUpdate(ks: KalmanState, price: number, dtMinutes: number): void {
 function buildFeatureVectorV2(
   price:          number,
   ind:            IndicatorValues,
-  tech:           CrudeTechnicals,
+  tech:           NiftyTechnicals,
   istHour:        number,
   istMinute:      number,
-  flowState:      CrudeFlowState | null,
+  flowState:      NiftyFlowState | null,
   depth?:         { buy: { price: number; quantity: number; orders: number }[]; sell: { price: number; quantity: number; orders: number }[] },
   kalmanVelocity: number = 0,
 ): number[] {
   const c = (v: number, scale = 1) =>
     Math.max(-1, Math.min(1, Number.isFinite(v) ? v * scale : 0))
 
-  // Orderbook features (or zeros if no depth)
   let obi = 0, mpEdgeTicks = 0, spreadTicks = 0, qpoBalance = 0
   if (depth) {
     const bids = depth.buy.filter(l => l.quantity > 0)
@@ -1090,8 +1063,7 @@ function buildFeatureVectorV2(
       const micro = (bestAsk.price * bestBid.quantity + bestBid.price * bestAsk.quantity) / (bestBid.quantity + bestAsk.quantity)
       const tickSz = Math.max(1, bestAsk.price - bestBid.price)
       mpEdgeTicks = (micro - mid) / tickSz
-      // dim[2]: bid-ask spread in ticks (normalized: 1 tick = 0, 5 ticks = 1)
-      spreadTicks = Math.min(1, (bestAsk.price - bestBid.price) / tickSz / 5) * 2 - 1  // -1=tight, +1=wide
+      spreadTicks = Math.min(1, (bestAsk.price - bestBid.price) / tickSz / 5) * 2 - 1
       const bidQpo = bestBid.orders > 0 ? bestBid.quantity / bestBid.orders : 0
       const askQpo = bestAsk.orders > 0 ? bestAsk.quantity / bestAsk.orders : 0
       const qpoSum = bidQpo + askQpo
@@ -1099,11 +1071,11 @@ function buildFeatureVectorV2(
     }
   }
 
-  // time-of-day: MCX open 9:00am, close 11:30pm (870 min session)
-  const minsFromOpen = istHour * 60 + istMinute - 9 * 60
-  const timeOfDay = c(minsFromOpen / 870 * 2 - 1)  // -1=session open, +1=session close
+  // NSE session: 9:15 AM – 3:30 PM (375 min)
+  const minsFromOpen = istHour * 60 + istMinute - NSE_OPEN_HOUR * 60 - NSE_OPEN_MIN
+  const sessionDuration = (NSE_CLOSE_HOUR * 60 + NSE_CLOSE_MIN) - (NSE_OPEN_HOUR * 60 + NSE_OPEN_MIN)
+  const timeOfDay = c(minsFromOpen / sessionDuration * 2 - 1)
 
-  // Flow state dims (from bot) or fallbacks
   const cdZ       = flowState ? c(flowState.cdZScore, 0.33)  : c(tech.momentum5m, 100)
   const aggrRatio = flowState ? c(flowState.aggressionRatio) : c(tech.momentum1m, 200)
   const cusumNet  = flowState
@@ -1111,21 +1083,21 @@ function buildFeatureVectorV2(
     : 0
 
   return [
-    c(cdZ),                                                             // 0: cdZScore (costly signal)
-    c(mpEdgeTicks, 0.5),                                                // 1: microprice edge
-    c(spreadTicks),                                                     // 2: bid-ask spread (replaces dup depthAsymm)
-    c(qpoBalance),                                                      // 3: QPO balance
-    c(tech.momentum1m, 200),                                            // 4: 1-min momentum
-    c(tech.momentum5m, 100),                                            // 5: 5-min momentum
-    c(ind.rsi != null ? (ind.rsi - 50) / 50 : 0),                      // 6: RSI centered
-    c(tech.emaCrossover === 'BULL' ? 1 : tech.emaCrossover === 'BEAR' ? -1 : 0), // 7: EMA cross
-    c(tech.vwapAlign === 'BULL' ? 1 : tech.vwapAlign === 'BEAR' ? -1 : 0),       // 8: VWAP align
-    c(tech.rangePosition * 2 - 1),                                      // 9: range position
-    c(ind.atrPct != null ? (ind.atrPct - 0.3) / 0.3 : 0),              // 10: ATR% normalized
-    timeOfDay,                                                           // 11: time-of-day
-    c(aggrRatio),                                                        // 12: aggression ratio
-    c(cusumNet),                                                         // 13: CUSUM net
-    c(kalmanVelocity / 5),                                              // 14: Kalman velocity (±₹5/min → ±1)
+    c(cdZ),
+    c(mpEdgeTicks, 0.5),
+    c(spreadTicks),
+    c(qpoBalance),
+    c(tech.momentum1m, 200),
+    c(tech.momentum5m, 100),
+    c(ind.rsi != null ? (ind.rsi - 50) / 50 : 0),
+    c(tech.emaCrossover === 'BULL' ? 1 : tech.emaCrossover === 'BEAR' ? -1 : 0),
+    c(tech.vwapAlign === 'BULL' ? 1 : tech.vwapAlign === 'BEAR' ? -1 : 0),
+    c(tech.rangePosition * 2 - 1),
+    c(ind.atrPct != null ? (ind.atrPct - 0.3) / 0.3 : 0),
+    timeOfDay,
+    c(aggrRatio),
+    c(cusumNet),
+    c(kalmanVelocity / 20),                                           // 14: Kalman velocity (±₹20/min → ±1)
   ]
 }
 
@@ -1134,12 +1106,11 @@ function buildFeatureVectorV2(
 function resolveOutcomesV2(patterns: PatternV2[], snapshots: Snapshot[], kalmanVelocity: number) {
   const now = Date.now()
   for (const p of patterns) {
-    // Raw outcomes — same logic as v1
     if (p.outcome5 === null && now - p.ts >= OUTCOME_5_MS) {
       const snap = snapshots.find(s => s.ts >= p.ts + OUTCOME_5_MS)
       if (snap) {
         p.outcome5 = ((snap.price - p.price) / p.price) * 100
-        p.detrended5 = p.outcome5 - kalmanVelocity / p.price * 5  // subtract 5min expected drift
+        p.detrended5 = p.outcome5 - kalmanVelocity / p.price * 5
       }
     }
     if (p.outcome15 === null && now - p.ts >= OUTCOME_15_MS) {
@@ -1159,11 +1130,9 @@ function resolveOutcomesV2(patterns: PatternV2[], snapshots: Snapshot[], kalmanV
   }
 }
 
-// ── V2 KNN query (session-scoped, uses de-trended outcomes) ──────────────────
+// ── V2 KNN query ──────────────────────────────────────────────────────────────
 
-function queryAttentionV2(queryVec: number[], sessionPatterns: PatternV2[]): CrudePrediction {
-  // Prefer de-trended outcomes; fall back to raw
-  // Drop zero-vector patterns (captured without live orderbook/flow data — pure noise)
+function queryAttentionV2(queryVec: number[], sessionPatterns: PatternV2[]): NiftyPrediction {
   const vecNorm = (v: number[]) => Math.sqrt(v.reduce((s, x) => s + x * x, 0))
   const resolved = sessionPatterns.filter(p => p.outcome20 !== null && p.outcome20 !== 0 && vecNorm(p.vec) > 0.1)
   if (resolved.length < MIN_PATTERNS_V2) {
@@ -1216,36 +1185,32 @@ function queryAttentionV2(queryVec: number[], sessionPatterns: PatternV2[]): Cru
 
 // ── V2 persistence ────────────────────────────────────────────────────────────
 
-function patternsV2FileFor(product: CrudeProduct): string {
-  return path.join('/workspace/option-trader', `crude-${product.toLowerCase()}-patternsv2.json`)
-}
-
-function ensurePatternsV2Loaded(ps: ProductState, product: CrudeProduct) {
+function ensurePatternsV2Loaded(ps: ProductState) {
   if (ps.patternsV2Loaded) return
   ps.patternsV2Loaded = true
-  try {
-    const raw = fs.readFileSync(patternsV2FileFor(product), 'utf8')
-    const saved = JSON.parse(raw) as { morning?: PatternV2[]; afternoon?: PatternV2[]; evening?: PatternV2[] }
-    for (const key of ['morning', 'afternoon', 'evening'] as MCXSession[]) {
-      if (Array.isArray(saved[key])) {
-        ps.patternsV2[key] = saved[key]!
-          .filter(p => Array.isArray(p.vec) && p.vec.length >= 14)
+  for (const key of ['morning', 'afternoon', 'evening'] as NSESession[]) {
+    try {
+      const raw = fs.readFileSync(patternsV2File(key), 'utf8')
+      const saved = JSON.parse(raw) as { patterns?: PatternV2[] }
+      if (Array.isArray(saved.patterns)) {
+        ps.patternsV2[key] = saved.patterns
+          .filter(p => Array.isArray(p.vec) && p.vec.length === VEC_DIM_V2)
           .slice(-MAX_PATTERNS_V2)
       }
-    }
-  } catch { /* no file yet */ }
+    } catch { /* no file yet */ }
+  }
 }
 
-function persistPatternsV2(ps: ProductState, product: CrudeProduct) {
-  try {
-    fs.writeFileSync(patternsV2FileFor(product), JSON.stringify({
-      morning:   ps.patternsV2.morning.slice(-MAX_PATTERNS_V2),
-      afternoon: ps.patternsV2.afternoon.slice(-MAX_PATTERNS_V2),
-      evening:   ps.patternsV2.evening.slice(-MAX_PATTERNS_V2),
-      savedAt:   Date.now(),
-    }))
-    ps.patternsV2LastPersistTs = Date.now()
-  } catch { /* ignore */ }
+function persistPatternsV2(ps: ProductState) {
+  for (const key of ['morning', 'afternoon', 'evening'] as NSESession[]) {
+    try {
+      fs.writeFileSync(patternsV2File(key), JSON.stringify({
+        patterns: ps.patternsV2[key].slice(-MAX_PATTERNS_V2),
+        savedAt: Date.now(),
+      }))
+    } catch { /* ignore */ }
+  }
+  ps.patternsV2LastPersistTs = Date.now()
 }
 
 // ── Cosine Similarity ─────────────────────────────────────────────────────────
@@ -1262,7 +1227,7 @@ function cosineSim(a: number[], b: number[]): number {
   return denom > 1e-10 ? dot / denom : 0
 }
 
-// ── KNN Query (attention-style: Q·K softmax → V) ────────────────────────────
+// ── KNN Query ────────────────────────────────────────────────────────────────
 
 interface HorizonResult {
   predictedMove: number
@@ -1273,7 +1238,7 @@ interface HorizonResult {
 function queryHorizon(
   weights: number[],
   topK: { sim: number; i: number }[],
-  resolved: CrudePattern[],
+  resolved: NiftyPattern[],
   horizon: 'outcome5' | 'outcome15' | 'outcome20',
 ): HorizonResult {
   let predictedMove = 0, bullWeight = 0, bearWeight = 0, totalW = 0
@@ -1294,8 +1259,7 @@ function queryHorizon(
   }
 }
 
-function queryAttention(queryVec: number[], store: CrudeStore): CrudePrediction {
-  // outcome20 === 0 exactly = session-boundary-zeroed (not genuinely flat; real outcomes are floating-point non-zero)
+function queryAttention(queryVec: number[], store: NiftyStore): NiftyPrediction {
   const resolved = store.patterns.filter(p => p.outcome20 !== null && p.outcome20 !== 0 && Math.sqrt(p.vec.reduce((s: number, x: number) => s + x * x, 0)) > 0.1)
 
   if (resolved.length < MIN_PATTERNS) {
@@ -1307,24 +1271,20 @@ function queryAttention(queryVec: number[], store: CrudeStore): CrudePrediction 
     }
   }
 
-  // Q · K — cosine similarity between query and all stored patterns
   const sims = resolved.map(p => cosineSim(queryVec, p.vec))
   const indexed = sims.map((sim, i) => ({ sim, i }))
   indexed.sort((a, b) => b.sim - a.sim)
   const topK = indexed.slice(0, Math.min(KNN_K, resolved.length))
 
-  // Softmax over similarities → attention weights
   const maxSim = topK[0].sim
   const expScores = topK.map(t => Math.exp((t.sim - maxSim) / TEMPERATURE))
   const sumExp = expScores.reduce((a, b) => a + b, 0)
   const weights = expScores.map(e => e / sumExp)
 
-  // V — query each outcome horizon with same attention weights
-  const h5 = queryHorizon(weights, topK, resolved, 'outcome5')
+  const h5  = queryHorizon(weights, topK, resolved, 'outcome5')
   const h15 = queryHorizon(weights, topK, resolved, 'outcome15')
   const h20 = queryHorizon(weights, topK, resolved, 'outcome20')
 
-  // Primary prediction uses 20-min horizon (matches syslog cycle)
   return {
     predictedMove: h20.predictedMove, bullProb: h20.bullProb, bearProb: h20.bearProb,
     topSim: topK[0].sim, confidence: weights[0], nResolved: resolved.length,
@@ -1334,26 +1294,23 @@ function queryAttention(queryVec: number[], store: CrudeStore): CrudePrediction 
   }
 }
 
-// ── Outcome Resolution (multi-horizon: 5m, 15m, 20m) ────────────────────────
+// ── Outcome Resolution ────────────────────────────────────────────────────────
 
-function resolveOutcomes(store: CrudeStore) {
+function resolveOutcomes(store: NiftyStore) {
   const now = Date.now()
   for (const pattern of store.patterns) {
     if (pattern.sessionDay !== store.sessionDay) continue
 
-    // Resolve 5-min outcome
     if (pattern.outcome5 === null && now - pattern.ts >= OUTCOME_5_MS) {
       const snap = store.snapshots.find(s => s.ts >= pattern.ts + OUTCOME_5_MS)
       if (snap) pattern.outcome5 = ((snap.price - pattern.price) / pattern.price) * 100
     }
 
-    // Resolve 15-min outcome
     if (pattern.outcome15 === null && now - pattern.ts >= OUTCOME_15_MS) {
       const snap = store.snapshots.find(s => s.ts >= pattern.ts + OUTCOME_15_MS)
       if (snap) pattern.outcome15 = ((snap.price - pattern.price) / pattern.price) * 100
     }
 
-    // Resolve 20-min outcome
     if (pattern.outcome20 === null && now - pattern.ts >= OUTCOME_20_MS) {
       const snap = store.snapshots.find(s => s.ts >= pattern.ts + OUTCOME_20_MS)
       if (snap) pattern.outcome20 = ((snap.price - pattern.price) / pattern.price) * 100
@@ -1363,35 +1320,29 @@ function resolveOutcomes(store: CrudeStore) {
 
 // ── Composite Blending ────────────────────────────────────────────────────────
 
-function computeComposite(prediction: CrudePrediction, tech: CrudeTechnicals): CrudeComposite {
+function computeComposite(prediction: NiftyPrediction, tech: NiftyTechnicals): NiftyComposite {
   const votes: { score: number; weight: number }[] = []
 
-  // VWAP alignment
   if (tech.vwapAlign) {
     votes.push({ score: tech.vwapAlign === 'BULL' ? 1 : 0, weight: 1.2 })
   }
 
-  // EMA crossover
   if (tech.emaCrossover) {
     votes.push({ score: tech.emaCrossover === 'BULL' ? 1 : 0, weight: 1.0 })
   }
 
-  // RSI
   if (tech.rsi != null) {
     votes.push({ score: Math.max(0, Math.min(1, (tech.rsi - 30) / 40)), weight: 0.8 })
   }
 
-  // Momentum 5m
   if (Math.abs(tech.momentum5m) > 0.0005) {
     votes.push({ score: tech.momentum5m > 0 ? 1 : 0, weight: 1.0 })
   }
 
-  // Range position (near high = bull, near low = bear)
   if (tech.sessionHigh > tech.sessionLow) {
     votes.push({ score: tech.rangePosition, weight: 0.6 })
   }
 
-  // Momentum 1m
   if (Math.abs(tech.momentum1m) > 0.0002) {
     votes.push({ score: tech.momentum1m > 0 ? 1 : 0, weight: 0.5 })
   }
@@ -1423,7 +1374,6 @@ function computeComposite(prediction: CrudePrediction, tech: CrudeTechnicals): C
   const techImpliedMove = techDeviation * TYPICAL_MOVE
   const blendedMove = (patternWeight * patMove + techWeight * techImpliedMove) / totalWeight
 
-  // Horizon alignment bonus: when 5m, 15m, 20m all agree on direction, boost confidence
   let horizonBonus = 0
   if (patternReady && prediction.h5 && prediction.h15 && prediction.h20) {
     const s5 = Math.sign(prediction.h5.predictedMove)
@@ -1452,33 +1402,13 @@ function computeComposite(prediction: CrudePrediction, tech: CrudeTechnicals): C
   }
 }
 
-// ── SysLog ────────────────────────────────────────────────────────────────────
-
-// ── MCX option fee calculator (shared with UI) ────────────────────────────────
-
-function mcxOptFees(entryPremium: number, exitPremium: number, lotSize: number): number {
-  const buyT  = entryPremium * lotSize
-  const sellT = exitPremium  * lotSize
-  const brokerage = 40                           // ₹20/order × 2
-  const exchg     = (buyT + sellT) * 0.00021     // MCX non-agri 0.021%
-  const ctt       = sellT * 0.0005               // CTT 0.05% on sell
-  const gst       = (brokerage + exchg) * 0.18  // GST 18% on brokerage+exchange
-  const sebi      = (buyT + sellT) * 0.000001    // ₹10/crore
-  const stamp     = buyT * 0.00003               // stamp duty 0.003% buy side
-  return brokerage + exchg + ctt + gst + sebi + stamp
-}
-
 // ── P20C Swing persistence ────────────────────────────────────────────────────
 
-function p20cSwingFileFor(product: CrudeProduct): string {
-  return path.join('/workspace/option-trader', `crude-${product.toLowerCase()}-p20csyslog.json`)
-}
-
-function ensureP20CSwingLoaded(ps: ProductState, product: CrudeProduct) {
+function ensureP20CSwingLoaded(ps: ProductState) {
   if (ps.p20cSwingLoaded) return
   ps.p20cSwingLoaded = true
   try {
-    const raw = fs.readFileSync(p20cSwingFileFor(product), 'utf8')
+    const raw = fs.readFileSync(p20cSwingFile(), 'utf8')
     const saved = JSON.parse(raw) as { entries?: P20CSwingEntry[] }
     if (Array.isArray(saved.entries)) {
       ps.p20cSwingStore.entries = saved.entries.slice(-MAX_P20C_SWINGS)
@@ -1487,9 +1417,9 @@ function ensureP20CSwingLoaded(ps: ProductState, product: CrudeProduct) {
   } catch {}
 }
 
-function persistP20CSwing(ps: ProductState, product: CrudeProduct) {
+function persistP20CSwing(ps: ProductState) {
   try {
-    fs.writeFileSync(p20cSwingFileFor(product), JSON.stringify({ entries: ps.p20cSwingStore.entries }, null, 2))
+    fs.writeFileSync(p20cSwingFile(), JSON.stringify({ entries: ps.p20cSwingStore.entries }, null, 2))
   } catch {}
 }
 
@@ -1497,20 +1427,19 @@ function persistP20CSwing(ps: ProductState, product: CrudeProduct) {
 
 async function updateP20CSysLog(
   ps: ProductState,
-  product: CrudeProduct,
   pat20Con: Pat20Con | null,
-  composite: CrudeComposite,
+  composite: NiftyComposite,
   spot: number,
-  chain: ReturnType<typeof getCrudeChain>
+  chain: NiftyFutChain | null
 ): Promise<P20CSwingEntry[]> {
-  ensureP20CSwingLoaded(ps, product)
+  ensureP20CSwingLoaded(ps)
   const now = Date.now()
   const ist = getISTHourMin(now)
   const mins = ist.hour * 60 + ist.minute
-  const inWindow = mins >= MCX_OPEN_HOUR * 60 + MCX_OPEN_MIN && mins <= MCX_CLOSE_HOUR * 60 + MCX_CLOSE_MIN
+  const inWindow = mins >= NSE_OPEN_HOUR * 60 + NSE_OPEN_MIN && mins <= NSE_CLOSE_HOUR * 60 + NSE_CLOSE_MIN
   const fmtTime = `${String(ist.hour).padStart(2, '0')}:${String(ist.minute).padStart(2, '0')}`
   const currentDay = new Date(now + 5.5 * 3600_000).toISOString().slice(0, 10)
-  const lotSize = product === 'CRUDEOIL' ? 100 : 10
+  const lotSize = 65
 
   const currentDir = pat20Con?.direction ?? null
   const scaled = pat20Con ? (pat20Con.effective - 0.5) * 2 : 0
@@ -1518,7 +1447,6 @@ async function updateP20CSysLog(
   const openSwing = ps.p20cSwingStore.entries.findLast(e => !e.resolved) ?? null
   let changed = false
 
-  // Close open swing if direction changed
   if (openSwing && currentDir !== openSwing.direction) {
     const spotDiff = spot - openSwing.spotAtStart
     const outcomeMove = openSwing.spotAtStart > 0 ? (spotDiff / openSwing.spotAtStart) * 100 : 0
@@ -1527,8 +1455,8 @@ async function updateP20CSysLog(
     let optExit: number | null = null
     if (openSwing.optSymbol) {
       try {
-        const ltpData = await kiteGetLTP([`MCX:${openSwing.optSymbol}`])
-        const ltp = ltpData[`MCX:${openSwing.optSymbol}`]?.last_price ?? 0
+        const ltpData = await kiteGetLTP([`NFO:${openSwing.optSymbol}`])
+        const ltp = ltpData[`NFO:${openSwing.optSymbol}`]?.last_price ?? 0
         if (ltp > 0) optExit = ltp
       } catch {}
     }
@@ -1536,8 +1464,15 @@ async function updateP20CSysLog(
     let pnlGross: number | null = null
     let pnlNet: number | null = null
     if (openSwing.optEntry != null && optExit != null) {
+      // NSE option fees: brokerage ₹40 + STT 0.05% sell + GST 18%
+      const buyT  = openSwing.optEntry * lotSize
+      const sellT = optExit * lotSize
+      const brokerage = 40
+      const stt = sellT * 0.0005
+      const gst = brokerage * 0.18
+      const fees = brokerage + stt + gst
       pnlGross = (optExit - openSwing.optEntry) * lotSize
-      pnlNet = pnlGross - mcxOptFees(openSwing.optEntry, optExit, lotSize)
+      pnlNet = pnlGross - fees
     }
 
     openSwing.resolved   = true
@@ -1554,7 +1489,6 @@ async function updateP20CSysLog(
     changed = true
   }
 
-  // Open new swing if direction is BULL or BEAR, no open swing, AND oracle aligns, AND market is open
   const oracleAligned = composite.direction === currentDir
     && Math.abs(composite.predictedMove) >= 0.06
     && composite.confidence >= 0.25
@@ -1570,8 +1504,8 @@ async function updateP20CSysLog(
       const atmOpt  = optList.find(o => o.strike === chain.atmStrike)
       if (atmOpt) {
         try {
-          const ltpData = await kiteGetLTP([`MCX:${atmOpt.tradingsymbol}`])
-          const ltp = ltpData[`MCX:${atmOpt.tradingsymbol}`]?.last_price ?? 0
+          const ltpData = await kiteGetLTP([`NFO:${atmOpt.tradingsymbol}`])
+          const ltp = ltpData[`NFO:${atmOpt.tradingsymbol}`]?.last_price ?? 0
           if (ltp > 0) {
             optEntry  = ltp
             optStrike = chain.atmStrike
@@ -1600,7 +1534,7 @@ async function updateP20CSysLog(
     changed = true
   }
 
-  if (changed) persistP20CSwing(ps, product)
+  if (changed) persistP20CSwing(ps)
   return ps.p20cSwingStore.entries.slice(-30)
 }
 
@@ -1608,20 +1542,19 @@ async function updateP20CSysLog(
 
 interface OptInfo { strike: number; type: 'CE' | 'PE'; symbol: string; entryLtp: number }
 
-async function updateSysLog(ps: ProductState, product: CrudeProduct, composite: CrudeComposite, spot: number, chain: ReturnType<typeof getCrudeChain>): Promise<CrudeSysLogEntry[]> {
-  ensureSysLogLoaded(ps, product)
+async function updateSysLog(ps: ProductState, composite: NiftyComposite, spot: number, chain: NiftyFutChain | null): Promise<NiftySysLogEntry[]> {
+  ensureSysLogLoaded(ps)
   const sysLogStore = ps.sysLogStore
   const now = Date.now()
   const ist = getISTHourMin(now)
   const mins = ist.hour * 60 + ist.minute
-  const inWindow = mins >= MCX_OPEN_HOUR * 60 + MCX_OPEN_MIN && mins <= MCX_CLOSE_HOUR * 60 + MCX_CLOSE_MIN
+  const inWindow = mins >= NSE_OPEN_HOUR * 60 + NSE_OPEN_MIN && mins <= NSE_CLOSE_HOUR * 60 + NSE_CLOSE_MIN
 
-  // Compute conviction early — needed both for extension check and new-entry gate
   const dirProb = Math.max(composite.bullProb, composite.bearProb)
   const hasConviction = composite.confidence >= 0.20 || dirProb >= 0.65 || Math.abs(composite.predictedMove) >= 0.08
 
   let changed = false
-  let entryToExtend: CrudeSysLogEntry | null = null
+  let entryToExtend: NiftySysLogEntry | null = null
 
   for (const entry of sysLogStore.entries) {
     if (entry.resolved) continue
@@ -1645,13 +1578,10 @@ async function updateSysLog(ps: ProductState, product: CrudeProduct, composite: 
     const timeUp = now - entry.cycleTs >= SYSLOG_CYCLE_MS
     if (!timeUp && !entry.targetHit) continue
 
-    // Extension: target hit (not time-expired) and composite still in same direction.
-    // Use predictedMove sign as fallback when composite.direction is null but still directional.
-    // Target hit IS the conviction signal — no hasConviction gate needed here.
     const extDir = composite.direction ?? (composite.predictedMove > 0 ? 'BULL' : composite.predictedMove < 0 ? 'BEAR' : null)
     if (entry.targetHit && !timeUp && extDir === entry.predDir && composite.status === 'ready' && spot > 0) {
       entryToExtend = entry
-      continue  // don't resolve; async extension handled after loop
+      continue
     }
 
     entry.outcomeMove = currentMove
@@ -1659,8 +1589,6 @@ async function updateSysLog(ps: ProductState, product: CrudeProduct, composite: 
     entry.spotAtOutcome = spot
     entry.resolved = true
 
-    // Extended trade: if any prior cycles hit AND spot is still positive vs the ORIGINAL
-    // entry baseline, the whole trade counts as a hit (even if Nth cycle didn't reach its target)
     if (!entry.targetHit && entry.extends && entry.extends.length > 0) {
       const originalSpot = entry.extends[0].spotAtExtend
       const overallMove = originalSpot > 0 ? (spot - originalSpot) / originalSpot * 100 : 0
@@ -1673,13 +1601,11 @@ async function updateSysLog(ps: ProductState, product: CrudeProduct, composite: 
     changed = true
   }
 
-  // EXTENSION — async: fetch fresh option LTP for the new cycle
   if (entryToExtend) {
     const e = entryToExtend
     const fmtCycle = `${String(ist.hour).padStart(2, '0')}:${String(ist.minute).padStart(2, '0')}`
 
     if (!e.extends) e.extends = []
-    // Preserve original option entry price on first extension
     if (e.extends.length === 0 && e.originalOptEntry == null) {
       e.originalOptEntry = e.optEntry ?? null
     }
@@ -1688,11 +1614,9 @@ async function updateSysLog(ps: ProductState, product: CrudeProduct, composite: 
       cycleTime: fmtCycle,
       spotAtExtend: e.spotAtPred,
       prevPredMove: e.predMove,
-      // No per-cycle P&L stored — cumulative P&L uses originalOptEntry→final optTarget
     })
     e.repeatCount = (e.repeatCount ?? 1) + 1
 
-    // Fetch new option LTP at current spot
     let newOptEntry: number | null = null
     let newOptTarget: number | null = null
     const extDir = composite.direction ?? (composite.predictedMove > 0 ? 'BULL' : 'BEAR')
@@ -1702,7 +1626,7 @@ async function updateSysLog(ps: ProductState, product: CrudeProduct, composite: 
       const atmOpt = optList.find(o => o.strike === atm)
       if (atmOpt) {
         try {
-          const ltpKey = `MCX:${atmOpt.tradingsymbol}`
+          const ltpKey = `NFO:${atmOpt.tradingsymbol}`
           const ltpData = await kiteGetLTP([ltpKey])
           const ltp = ltpData[ltpKey]?.last_price ?? 0
           if (ltp > 0) {
@@ -1716,7 +1640,6 @@ async function updateSysLog(ps: ProductState, product: CrudeProduct, composite: 
       }
     }
 
-    // Advance entry to new cycle baseline
     e.spotAtPred = spot
     e.predMove = composite.predictedMove
     e.predSpot = spot * (1 + composite.predictedMove / 100)
@@ -1731,12 +1654,12 @@ async function updateSysLog(ps: ProductState, product: CrudeProduct, composite: 
     e.cycleTs = now
     e.optEntry = newOptEntry
     e.optTarget = newOptTarget
-    sysLogStore.lastCycleTs = now  // suppress new entry creation this tick
+    sysLogStore.lastCycleTs = now
     changed = true
   }
 
   if (changed) {
-    persistSysLog(ps, product)
+    persistSysLog(ps)
     if (!entryToExtend) {
       const lastEntry = sysLogStore.entries[sysLogStore.entries.length - 1]
       if (lastEntry?.resolved && lastEntry.targetHit && now - lastEntry.cycleTs < SYSLOG_CYCLE_MS) {
@@ -1745,16 +1668,11 @@ async function updateSysLog(ps: ProductState, product: CrudeProduct, composite: 
     }
   }
 
-  // Minimum quality filters: skip noise predictions
-
   if (inWindow && now - sysLogStore.lastCycleTs >= SYSLOG_CYCLE_MS && composite.status === 'ready' && spot > 0 && hasConviction) {
     const currentDay = new Date(now + 5.5 * 3600_000).toISOString().slice(0, 10)
 
-    // Reserve the slot immediately before any await — prevents concurrent calls from
-    // both passing the time gate and pushing duplicate entries
     sysLogStore.lastCycleTs = now
 
-    // Fetch ATM option LTP right here — avoids timing gap when lastCycleTs resets mid-call
     let optInfo: OptInfo | null = null
     const optDir = composite.direction ?? (composite.predictedMove > 0 ? 'BULL' : composite.predictedMove < 0 ? 'BEAR' : null)
     if (chain && optDir) {
@@ -1763,7 +1681,7 @@ async function updateSysLog(ps: ProductState, product: CrudeProduct, composite: 
       const atmOpt = optList.find(o => o.strike === atm)
       if (atmOpt) {
         try {
-          const ltpKey = `MCX:${atmOpt.tradingsymbol}`
+          const ltpKey = `NFO:${atmOpt.tradingsymbol}`
           const ltpData = await kiteGetLTP([ltpKey])
           const entryLtp = ltpData[ltpKey]?.last_price ?? 0
           if (entryLtp > 0) {
@@ -1806,98 +1724,114 @@ async function updateSysLog(ps: ProductState, product: CrudeProduct, composite: 
     if (sysLogStore.entries.length > MAX_SYSLOG) {
       sysLogStore.entries = sysLogStore.entries.slice(-MAX_SYSLOG)
     }
-    persistSysLog(ps, product)
+    persistSysLog(ps)
   }
 
   return sysLogStore.entries.slice(-30)
 }
 
+// ── State file reader ─────────────────────────────────────────────────────────
+
+const NIFTY_FUT_STATE_FILE = path.join('/workspace/option-trader', 'nifty-fut-state.json')
+
+function readNiftyFutTick(): {
+  ltp: number; depth: any; volume: number; oi: number; cumDelta: number;
+  cdZScore: number; aggressionRatio: number; cusumPos: number; cusumNeg: number;
+  symbol: string; token: number
+} | null {
+  try {
+    const raw = fs.readFileSync(NIFTY_FUT_STATE_FILE, 'utf8')
+    const data = JSON.parse(raw)
+    if (Date.now() - data.updatedAt > 120_000) return null  // stale > 2min
+    return data
+  } catch { return null }
+}
+
 // ── Main Entry Point ──────────────────────────────────────────────────────────
 
-export async function getCrudeState(product: CrudeProduct = 'CRUDEOIL'): Promise<CrudeState> {
+export async function getNiftyFutState(): Promise<NiftyFutState> {
   startBackgroundAccumulator()
-  const ps = getProductState(product)
+  const ps = getNiftyProductState()
   const store = ps.store
-  ensureLoaded(ps, product)
-  ensureP20CBufLoaded(ps, product)
+  ensureLoaded(ps)
+  ensureP20CBufLoaded(ps)
 
   const now = Date.now()
   const ist = getISTHourMin(now)
   const mins = ist.hour * 60 + ist.minute
-  const marketOpen = mins >= MCX_OPEN_HOUR * 60 + MCX_OPEN_MIN && mins <= MCX_CLOSE_HOUR * 60 + MCX_CLOSE_MIN
+  const marketOpen = mins >= NSE_OPEN_HOUR * 60 + NSE_OPEN_MIN && mins <= NSE_CLOSE_HOUR * 60 + NSE_CLOSE_MIN
   const currentDay = new Date(now + 5.5 * 3600_000).toISOString().slice(0, 10)
 
-  const future = getNearestCrudeFuture(product)
-  if (!future) return emptyState(product, marketOpen)
-
-  // Read tick-by-tick data from bot's WebSocket feed (crude-state.json)
-  // Falls back to Kite REST API if bot isn't running
+  // Read tick-by-tick data from bot's WebSocket feed (nifty-fut-state.json)
   let spot = 0
-  let depth: CrudeState['depth'] | undefined
+  let depth: NiftyFutState['depth'] | undefined
   let volume = 0
   let oi = 0
-  let flowState: CrudeFlowState | null = null
+  let flowState: NiftyFlowState | null = null
+  let futureSymbol = ''
+  let futureToken = ps.instrumentToken
 
-  const CRUDE_STATE_FILE = path.join('/workspace/option-trader', 'crude-state.json')
-  try {
-    const raw = fs.readFileSync(CRUDE_STATE_FILE, 'utf8')
-    const csData = JSON.parse(raw)
-    const productData = csData?.products?.[product]
-    if (productData && productData.ltp > 0 && Date.now() - (csData.updatedAt ?? 0) < 60_000) {
-      spot = productData.ltp
-      depth = productData.depth
-      volume = productData.volume ?? 0
-      oi = productData.oi ?? 0
-      if (typeof productData.cumDelta === 'number') {
-        const alarm = productData.cusumPos >= CUSUM_H ? 'BULL'
-          : productData.cusumNeg >= CUSUM_H ? 'BEAR' : null
-        flowState = {
-          cumDelta:        productData.cumDelta ?? 0,
-          cdZScore:        productData.cdZScore ?? 0,
-          aggressionRatio: productData.aggressionRatio ?? 0,
-          cusumPos:        productData.cusumPos ?? 0,
-          cusumNeg:        productData.cusumNeg ?? 0,
-          cusumAlarm:      alarm,
-        }
-        ps.lastFlowState = flowState
-        ps.lastFlowStateAt = Date.now()
-      }
+  const tick = readNiftyFutTick()
+  if (tick && tick.ltp > 0) {
+    spot = tick.ltp
+    depth = tick.depth
+    volume = tick.volume ?? 0
+    oi = tick.oi ?? 0
+    futureSymbol = tick.symbol ?? ''
+    if (tick.token > 0) {
+      ps.instrumentToken = tick.token
+      futureToken = tick.token
     }
-  } catch { /* file not found or stale — fall through to REST */ }
+    if (typeof tick.cumDelta === 'number') {
+      const alarm = tick.cusumPos >= CUSUM_H ? 'BULL'
+        : tick.cusumNeg >= CUSUM_H ? 'BEAR' : null
+      flowState = {
+        cumDelta:        tick.cumDelta ?? 0,
+        cdZScore:        tick.cdZScore ?? 0,
+        aggressionRatio: tick.aggressionRatio ?? 0,
+        cusumPos:        tick.cusumPos ?? 0,
+        cusumNeg:        tick.cusumNeg ?? 0,
+        cusumAlarm:      alarm,
+      }
+      ps.lastFlowState = flowState
+      ps.lastFlowStateAt = Date.now()
+    }
+  }
 
   // Serve last-known flowState for up to 5 min when file is temporarily stale
-  // (covers MCX hours after NSE close, brief WS reconnect gaps, etc.)
   if (!flowState && ps.lastFlowState && Date.now() - ps.lastFlowStateAt < 5 * 60_000) {
     flowState = ps.lastFlowState
   }
 
-  // Fallback: Kite REST API (when bot isn't running)
+  // Fallback: Kite REST API (when bot isn't running) — need symbol from instruments CSV
   if (spot <= 0) {
     try {
-      const quoteKey = `MCX:${future.tradingsymbol}`
-      const quote = await kiteGetQuote([quoteKey])
-      const q = quote[quoteKey]
-      if (q) {
-        spot = q.last_price
-        depth = q.depth
-        volume = q.volume ?? 0
-        oi = q.oi ?? 0
+      // Try to get NIFTY futures from instruments if we have a token
+      if (futureToken > 0) {
+        const quoteKey = `NFO:${futureSymbol || 'NIFTY26JUNFUT'}`
+        try {
+          const quote = await kiteGetQuote([quoteKey])
+          const q = quote[quoteKey]
+          if (q) {
+            spot = q.last_price
+            depth = q.depth
+            volume = q.volume ?? 0
+            oi = q.oi ?? 0
+          }
+        } catch {
+          const ltpData = await kiteGetLTP([`NFO:${futureSymbol || 'NIFTY26JUNFUT'}`])
+          spot = ltpData[`NFO:${futureSymbol || 'NIFTY26JUNFUT'}`]?.last_price ?? 0
+        }
       }
-    } catch {
-      try {
-        const ltpKey = `MCX:${future.tradingsymbol}`
-        const ltpData = await kiteGetLTP([ltpKey])
-        spot = ltpData[ltpKey]?.last_price ?? 0
-      } catch { /* both failed */ }
-    }
+    } catch { /* both failed */ }
   }
 
-  if (spot <= 0) return emptyState(product, marketOpen)
+  if (spot <= 0) return emptyState(marketOpen)
 
   // Warm indicators from historical data
-  if (!ps.engineWarmed || now - ps.lastWarmTs > 300_000) {
+  if ((!ps.engineWarmed || now - ps.lastWarmTs > 300_000) && futureToken > 0) {
     if (!ps.warmingPromise) {
-      ps.warmingPromise = warmIndicators(ps, future.instrumentToken).finally(() => { ps.warmingPromise = null })
+      ps.warmingPromise = warmIndicators(ps, futureToken).finally(() => { ps.warmingPromise = null })
     }
     if (!ps.engineWarmed) {
       await ps.warmingPromise
@@ -1906,12 +1840,11 @@ export async function getCrudeState(product: CrudeProduct = 'CRUDEOIL'): Promise
 
   // Session management
   if (store.sessionDay !== currentDay) {
-    // Drop stale unresolved V1 patterns (zeroing poisons kNN with false flat outcomes)
+    // Drop stale unresolved patterns (zeroing poisons kNN with false flat outcomes)
     store.patterns = store.patterns.filter(
       p => p.sessionDay === currentDay || p.outcome20 !== null
     )
-    // V2 stale patterns: drop unresolved ones (zeroing poisons kNN with false flat outcomes)
-    for (const key of ['morning', 'afternoon', 'evening'] as MCXSession[]) {
+    for (const key of ['morning', 'afternoon', 'evening'] as NSESession[]) {
       ps.patternsV2[key] = ps.patternsV2[key].filter(
         p => p.sessionDay === currentDay || p.outcome20 !== null
       )
@@ -1925,18 +1858,15 @@ export async function getCrudeState(product: CrudeProduct = 'CRUDEOIL'): Promise
     store.snapshots = []
     store.priceHistory = []
     ps.indicatorEngine.resetSession()
-    persist(ps, product) // save cleaned patterns
+    persist(ps)
   }
   if (store.sessionOpen <= 0) store.sessionOpen = spot
 
-  // Track full-session high/low
   if (spot > store.sessionHigh) store.sessionHigh = spot
   if (spot < store.sessionLow || store.sessionLow === 0) store.sessionLow = spot
 
-  // Update indicators
   const ind = ps.indicatorEngine.update(now, spot, volume)
 
-  // Track price history for momentum
   store.priceHistory.push({ ts: now, price: spot })
   const cutoff = now - 10 * 60_000
   store.priceHistory = store.priceHistory.filter(p => p.ts >= cutoff)
@@ -1950,7 +1880,7 @@ export async function getCrudeState(product: CrudeProduct = 'CRUDEOIL'): Promise
   const sessionLow = store.sessionLow
   const rangePosition = sessionHigh > sessionLow ? (spot - sessionLow) / (sessionHigh - sessionLow) : 0.5
 
-  const technicals: CrudeTechnicals = {
+  const technicals: NiftyTechnicals = {
     rsi: ind.rsi,
     emaShort: ind.emaShort,
     emaLong: ind.emaLong,
@@ -1969,7 +1899,6 @@ export async function getCrudeState(product: CrudeProduct = 'CRUDEOIL'): Promise
   const proxy = store.sessionOpen > 0 ? ((spot - store.sessionOpen) / store.sessionOpen) * 100 : 0
   const vec = buildFeatureVector(spot, ind, technicals, depth)
 
-  // Snapshot + pattern store (only during market hours to avoid stale-price pollution)
   if (marketOpen && now - store.lastSnapshotTs >= SNAPSHOT_INTERVAL_MS) {
     store.snapshots.push({ ts: now, vec, price: spot, proxy })
     if (store.snapshots.length > MAX_SNAPSHOTS) store.snapshots = store.snapshots.slice(-MAX_SNAPSHOTS)
@@ -1982,17 +1911,16 @@ export async function getCrudeState(product: CrudeProduct = 'CRUDEOIL'): Promise
   resolveOutcomes(store)
 
   // ── V2 Kalman + feature vector + session patterns ──────────────────────────
-  ensurePatternsV2Loaded(ps, product)
+  ensurePatternsV2Loaded(ps)
   const istHM = getISTHourMin(now)
-  const sessionKey = getMCXSession(istHM.hour, istHM.minute)
+  const sessionKey = getNSESession(istHM.hour, istHM.minute)
   const dtMinutes = ps.kalmanLastTs > 0 ? (now - ps.kalmanLastTs) / 60_000 : 1
   kalmanUpdate(ps.kalman, spot, dtMinutes)
   ps.kalmanLastTs = now
-  const kalmanVelocity = ps.kalman.x[1]  // ₹/min
+  const kalmanVelocity = ps.kalman.x[1]
 
   const vecV2 = buildFeatureVectorV2(spot, ind, technicals, istHM.hour, istHM.minute, flowState, depth, kalmanVelocity)
 
-  // Snapshot v2 pattern — uses own timestamp so V1 snapshot above doesn't block it
   if (marketOpen && now - ps.lastV2SnapshotTs >= SNAPSHOT_INTERVAL_MS) {
     ps.lastV2SnapshotTs = now
     const buf = ps.patternsV2[sessionKey]
@@ -2007,10 +1935,10 @@ export async function getCrudeState(product: CrudeProduct = 'CRUDEOIL'): Promise
   const predV2 = queryAttentionV2(vecV2, ps.patternsV2[sessionKey])
 
   if (now - ps.patternsV2LastPersistTs >= V2_PERSIST_INTERVAL_MS) {
-    persistPatternsV2(ps, product)
+    persistPatternsV2(ps)
   }
 
-  const v2: CrudeV2 = {
+  const v2: NiftyV2 = {
     prediction:          predV2,
     sessionKey,
     sessionPatternCount: ps.patternsV2[sessionKey].filter(p => p.outcome20 !== null).length,
@@ -2021,34 +1949,102 @@ export async function getCrudeState(product: CrudeProduct = 'CRUDEOIL'): Promise
 
   const prediction = queryAttention(vec, store)
 
-  // Pat20Con: sample pat-20m bullProb into rolling buffer (persisted so restarts don't blank GT)
   if (prediction.nResolved >= 3 && now - ps.p20cLastTs >= P20C_SAMPLE_MS) {
     ps.p20cBuf.push({ ts: now, bullProb: prediction.h20?.bullProb ?? prediction.bullProb })
     if (ps.p20cBuf.length > P20C_BUF_MAX) ps.p20cBuf = ps.p20cBuf.slice(-P20C_BUF_MAX)
     ps.p20cLastTs = now
     if (now - ps.p20cBufLastPersistTs >= PERSIST_INTERVAL_MS) {
-      persistP20CBuf(ps, product)
+      persistP20CBuf(ps)
     }
   }
   const pat20Con = computePat20Con(ps.p20cBuf, now)
 
   if (now - store.lastPersistTs >= PERSIST_INTERVAL_MS) {
-    persist(ps, product)
+    persist(ps)
   }
 
   const composite = computeComposite(prediction, technicals)
-  const chain = getCrudeChain(spot, product, 5)
+
+  // Build NIFTY chain from OI analytics
+  const niftyContracts = spot > 0 ? getNiftyContracts(spot) : null
+  let chain: NiftyFutChain | null = null
+  const cachedOI = getCachedNiftyOI()
+
+  if (cachedOI && spot > 0) {
+    const expiry = niftyContracts?.expiry ?? ''
+    chain = {
+      calls: cachedOI.strikes.map(s => ({
+        tradingsymbol: s.ceSymbol,
+        strike: s.strike,
+        expiry,
+        instrumentType: 'CE' as const,
+        product: 'NFO',
+      })),
+      puts: cachedOI.strikes.map(s => ({
+        tradingsymbol: s.peSymbol,
+        strike: s.strike,
+        expiry,
+        instrumentType: 'PE' as const,
+        product: 'NFO',
+      })),
+      spotEstimate: spot,
+      expiry,
+      product: 'NIFTY',
+      lotSize: 65,
+      strikeStep: 50,
+      atmStrike: cachedOI.atmStrike,
+      oiAnalytics: cachedOI,
+    }
+  } else if (niftyContracts && spot > 0) {
+    // Build minimal chain from contracts (no OI data yet)
+    const atm = Math.round(spot / 50) * 50
+    chain = {
+      calls: niftyContracts.bull.map(o => ({
+        tradingsymbol: o.tradingsymbol,
+        strike: o.strike,
+        expiry: niftyContracts.expiry,
+        instrumentType: 'CE' as const,
+        product: 'NFO',
+      })),
+      puts: niftyContracts.bear.map(o => ({
+        tradingsymbol: o.tradingsymbol,
+        strike: o.strike,
+        expiry: niftyContracts.expiry,
+        instrumentType: 'PE' as const,
+        product: 'NFO',
+      })),
+      spotEstimate: spot,
+      expiry: niftyContracts.expiry,
+      product: 'NIFTY',
+      lotSize: 65,
+      strikeStep: 50,
+      atmStrike: atm,
+    }
+  }
+
+  // Refresh OI in background
+  if (niftyContracts) {
+    fetchNiftyChainOI(niftyContracts).then(result => {
+      if (result && chain) {
+        chain.oiAnalytics = result
+        ps.lastOIAnalytics = result
+      }
+    }).catch(() => {})
+  }
+
+  // Inject last-known OI analytics if chain exists but has no oiAnalytics
+  if (chain && !chain.oiAnalytics && ps.lastOIAnalytics) {
+    chain.oiAnalytics = ps.lastOIAnalytics
+  }
 
   // Elliott Wave — refresh each timeframe on its own interval, fire-and-forget
-  // Timestamps are stamped immediately so concurrent requests don't pile up.
-  // Never awaited so slow Kite historical API near MCX close doesn't block the response.
-  if (future.instrumentToken > 0) {
+  if (futureToken > 0) {
     const tfsToRefresh = Object.keys(EW_TF_CONFIG).filter(
       tf => now - (ps.lastEWTsByTF[tf] ?? 0) >= EW_TF_CONFIG[tf].refreshMs
     )
     if (tfsToRefresh.length > 0) {
-      for (const tf of tfsToRefresh) ps.lastEWTsByTF[tf] = now  // stamp before firing
-      const token = future.instrumentToken
+      for (const tf of tfsToRefresh) ps.lastEWTsByTF[tf] = now
+      const token = futureToken
       Promise.all(tfsToRefresh.map(async tf => {
         const cfg = EW_TF_CONFIG[tf]
         try {
@@ -2071,30 +2067,15 @@ export async function getCrudeState(product: CrudeProduct = 'CRUDEOIL'): Promise
     }
   }
 
-  const sysLog     = await updateSysLog(ps, product, composite, spot, chain)
-  const p20cSysLog = await updateP20CSysLog(ps, product, pat20Con, composite, spot, chain)
-
-  // OI analytics: inject cached value first (never blank UI), then refresh in background
-  if (chain) {
-    const cachedOI = getCachedCrudeOI(product)
-    if (cachedOI) {
-      chain.oiAnalytics = cachedOI
-      ps.lastOIAnalytics = cachedOI          // update "last good" whenever cache is fresh
-    } else if (ps.lastOIAnalytics) {
-      chain.oiAnalytics = ps.lastOIAnalytics  // serve stale-but-continuous data
-    }
-    // Refresh in background — uses static import, not dynamic, for module stability
-    fetchChainOI(chain).then(result => {
-      if (result) ps.lastOIAnalytics = result
-    }).catch(() => {})
-  }
+  const sysLog     = await updateSysLog(ps, composite, spot, chain)
+  const p20cSysLog = await updateP20CSysLog(ps, pat20Con, composite, spot, chain)
 
   const minutesAccumulated = store.snapshots.length > 1
     ? Math.round((store.snapshots[store.snapshots.length - 1].ts - store.snapshots[0].ts) / 60_000)
     : 0
 
   const metaRegime = store.patterns.length >= 5
-    ? computeCrudeMetaRegime(store.patterns, 60)
+    ? computeNiftyMetaRegime(store.patterns, 60)
     : null
 
   return {
@@ -2103,15 +2084,12 @@ export async function getCrudeState(product: CrudeProduct = 'CRUDEOIL'): Promise
     patternCount: store.patterns.length,
     resolvedCount: store.patterns.filter(p => p.outcome20 !== null).length,
     proxy, minutesAccumulated, sysLog, p20cSysLog, chain,
-    spot, futureSymbol: future.tradingsymbol, futureToken: future.instrumentToken,
-    product, marketOpen, depth, pat20Con, elliottWave, elliottWaveByTF, metaRegime,
-    v2: marketOpen ? v2 : null,
+    spot, futureSymbol, futureToken,
+    marketOpen, depth, pat20Con, elliottWave, elliottWaveByTF, metaRegime, v2,
   }
 }
 
 // ── Background Accumulator ────────────────────────────────────────────────────
-// Runs every 60s regardless of browser activity so patterns accumulate during
-// the full MCX session (9:00–23:30) even when no tab is open.
 
 let _bgStarted = false
 
@@ -2119,18 +2097,17 @@ function startBackgroundAccumulator() {
   if (_bgStarted) return
   _bgStarted = true
   setInterval(async () => {
-    try { await getCrudeState('CRUDEOIL') } catch { /* ignore */ }
-    try { await getCrudeState('CRUDEOILM') } catch { /* ignore */ }
+    try { await getNiftyFutState() } catch { /* ignore */ }
   }, 60_000)
 }
 
-function emptyState(product: CrudeProduct, marketOpen: boolean): CrudeState {
+function emptyState(marketOpen: boolean): NiftyFutState {
   return {
     prediction: { predictedMove: 0, bullProb: 0.5, bearProb: 0.5, topSim: 0, confidence: 0, nResolved: 0, direction: null, status: 'no_data', h5: null, h15: null, h20: null },
     technicals: { rsi: null, emaShort: null, emaLong: null, emaCrossover: null, vwap: null, vwapAlign: null, atr: null, atrPct: null, momentum1m: 0, momentum5m: 0, sessionHigh: 0, sessionLow: 0, rangePosition: 0.5, volume: 0, oi: 0 },
     composite: { predictedMove: 0, bullProb: 0.5, bearProb: 0.5, direction: null, confidence: 0, status: 'no_data', components: { patternWeight: 0, techWeight: 0, patternBullProb: 0.5, techBullScore: 0.5 } },
     snapshotCount: 0, patternCount: 0, resolvedCount: 0, proxy: 0, minutesAccumulated: 0,
-    sysLog: [], p20cSysLog: [], chain: null, spot: 0, futureSymbol: '', futureToken: 0, product, marketOpen,
-    pat20Con: null, elliottWave: null, elliottWaveByTF: {}, metaRegime: null, v2: null,
+    sysLog: [], p20cSysLog: [], chain: null, spot: 0, futureSymbol: '', futureToken: 0,
+    marketOpen, pat20Con: null, elliottWave: null, elliottWaveByTF: {}, metaRegime: null, v2: null,
   }
 }

@@ -1,6 +1,7 @@
 import fs from 'fs'
 import path from 'path'
 import { getISTDateStr, getISTHourMin } from './tradingCalendar'
+import { kiteGetQuote } from './kite'
 
 const INSTRUMENTS_FILE = path.join('/workspace/option-trader', 'data', 'kite_instruments.csv')
 const STRIKE_STEP = 50
@@ -97,4 +98,152 @@ export function getNiftyContracts(spotEstimate: number): NiftyContracts | null {
   if (bull.length === 0 || bear.length === 0) return null
 
   return { bull, bear, spotEstimate, expiry, lotSize: LOT_SIZE }
+}
+
+// ── Option Chain OI Analytics ─────────────────────────────────────────────
+
+export interface NiftyOIAnalytics {
+  strikes: Array<{
+    strike: number
+    ceSymbol: string
+    peSymbol: string
+    ceOI: number
+    peOI: number
+    ceLtp: number
+    peLtp: number
+    callVol: number
+    putVol: number
+    painAtStrike: number
+  }>
+  maxPainStrike: number
+  maxPainPull: number
+  pcr: number
+  totalCallOI: number
+  totalPutOI: number
+  atmStrike: number
+}
+
+let niftyOiCache: { data: NiftyOIAnalytics; ts: number } | null = null
+const NIFTY_OI_CACHE_TTL = 30_000
+
+/** Synchronous read of the last successfully-fetched OI data (no API call). */
+export function getCachedNiftyOI(): NiftyOIAnalytics | null {
+  return niftyOiCache && Date.now() - niftyOiCache.ts < NIFTY_OI_CACHE_TTL
+    ? niftyOiCache.data : null
+}
+
+export async function fetchNiftyChainOI(contracts: NiftyContracts): Promise<NiftyOIAnalytics | null> {
+  if (niftyOiCache && Date.now() - niftyOiCache.ts < NIFTY_OI_CACHE_TTL) {
+    return niftyOiCache.data
+  }
+
+  const options = loadNiftyOptions()
+  if (options.length === 0) return null
+
+  const expiry = getNextExpiry(options)
+  if (!expiry) return null
+
+  const expiryOpts = options.filter(o => o.expiry === expiry)
+  const spot = contracts.spotEstimate
+  const atm = Math.round(spot / STRIKE_STEP) * STRIKE_STEP
+
+  // Scan ATM ± 5 strikes = 10 steps each side, 11 total
+  const scanStrikes: number[] = []
+  for (let i = -5; i <= 5; i++) {
+    scanStrikes.push(atm + i * STRIKE_STEP)
+  }
+
+  const callMap = new Map<number, NiftyOption>()
+  const putMap = new Map<number, NiftyOption>()
+  for (const s of scanStrikes) {
+    const ce = expiryOpts.find(o => o.strike === s && o.instrumentType === 'CE')
+    const pe = expiryOpts.find(o => o.strike === s && o.instrumentType === 'PE')
+    if (ce) callMap.set(s, ce)
+    if (pe) putMap.set(s, pe)
+  }
+
+  const instruments: string[] = []
+  for (const s of scanStrikes) {
+    const ce = callMap.get(s)
+    const pe = putMap.get(s)
+    if (ce) instruments.push(`NFO:${ce.tradingsymbol}`)
+    if (pe) instruments.push(`NFO:${pe.tradingsymbol}`)
+  }
+
+  if (instruments.length === 0) return null
+
+  let quotes: Record<string, { last_price: number; oi: number; volume: number; depth?: { buy: any[]; sell: any[] } }>
+  try {
+    quotes = await kiteGetQuote(instruments)
+  } catch {
+    return niftyOiCache?.data ?? null
+  }
+
+  const strikeData: NiftyOIAnalytics['strikes'] = []
+  let totalCallOI = 0
+  let totalPutOI = 0
+
+  for (const strike of scanStrikes) {
+    const ce = callMap.get(strike)
+    const pe = putMap.get(strike)
+    const cq = ce ? quotes[`NFO:${ce.tradingsymbol}`] : null
+    const pq = pe ? quotes[`NFO:${pe.tradingsymbol}`] : null
+
+    const ceOI = cq?.oi ?? 0
+    const peOI = pq?.oi ?? 0
+    const ceLtp = cq?.last_price ?? 0
+    const peLtp = pq?.last_price ?? 0
+    const callVol = cq?.volume ?? 0
+    const putVol = pq?.volume ?? 0
+
+    totalCallOI += ceOI
+    totalPutOI += peOI
+
+    strikeData.push({
+      strike,
+      ceSymbol: ce?.tradingsymbol ?? '',
+      peSymbol: pe?.tradingsymbol ?? '',
+      ceOI, peOI, ceLtp, peLtp, callVol, putVol,
+      painAtStrike: 0,
+    })
+  }
+
+  // Max Pain: for each candidate settlement strike, sum writer losses across all strikes
+  let minPain = Infinity
+  let maxPainStrike = atm
+  for (const candidate of strikeData) {
+    let pain = 0
+    for (const s of strikeData) {
+      if (candidate.strike > s.strike) pain += (candidate.strike - s.strike) * s.ceOI
+      if (candidate.strike < s.strike) pain += (s.strike - candidate.strike) * s.peOI
+    }
+    candidate.painAtStrike = pain
+    if (pain < minPain) {
+      minPain = pain
+      maxPainStrike = candidate.strike
+    }
+  }
+
+  const pcr = totalCallOI > 0 ? totalPutOI / totalCallOI : 0
+
+  // Pull strength: avg % pain increase at adjacent strikes
+  const mpIdx = strikeData.findIndex(s => s.strike === maxPainStrike)
+  let maxPainPull = 0
+  if (minPain > 0 && mpIdx >= 0) {
+    const neighbors: number[] = []
+    if (mpIdx > 0) neighbors.push(strikeData[mpIdx - 1].painAtStrike)
+    if (mpIdx < strikeData.length - 1) neighbors.push(strikeData[mpIdx + 1].painAtStrike)
+    if (neighbors.length > 0) {
+      const avgNeighborPain = neighbors.reduce((a, b) => a + b, 0) / neighbors.length
+      maxPainPull = Math.round((avgNeighborPain - minPain) / minPain * 100)
+    }
+  }
+
+  const result: NiftyOIAnalytics = {
+    strikes: strikeData,
+    maxPainStrike, maxPainPull, pcr,
+    totalCallOI, totalPutOI, atmStrike: atm,
+  }
+  niftyOiCache = { data: result, ts: Date.now() }
+  return result
 }

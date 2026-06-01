@@ -3,6 +3,7 @@ import { useEffect, useState, useRef, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import ThemeToggle from '@/components/ThemeToggle'
 import type { StockState, Position, CapitalData } from '@/lib/stockState'
+import DraggablePanelLayout, { type PanelDef } from '@/components/DraggablePanelLayout'
 
 type StockEntry = StockState & { name: string }
 
@@ -132,6 +133,16 @@ interface SysLogEntry {
   targetHitTs?: number | null
 }
 
+// ── Elliott Wave (client-side types) ──────────────────────────────────────────
+
+interface EWPivotC { ts: number; price: number; type: 'H'|'L'; wave: string; timeStr: string }
+interface EWLevelC { price: number; label: string; role: 'support'|'resistance'|'target' }
+interface EWState {
+  pattern: string; currentWave: string; pivots: EWPivotC[]; levels: EWLevelC[]
+  primaryTarget: number|null; invalidation: number|null; confidence: number
+  combinedBias: 'STRONG_BULL'|'BULL'|'NEUTRAL'|'BEAR'|'STRONG_BEAR'; combinedNote: string; updatedAt: number
+}
+
 interface N50State {
   prediction: N50Prediction
   technicals: N50Technicals
@@ -150,6 +161,17 @@ interface N50State {
   sysLog?: SysLogEntry[]
   autoTrader?: ATState
   heavyweights?: { name: string; weight: number; ltp: number; trend: string; cdZ: number; signal: string; vwap: string; pat30v2Bull: number; pat30v2Bear: number }[]
+  oiAnalytics?: {
+    strikes: Array<{
+      strike: number; ceSymbol: string; peSymbol: string
+      ceOI: number; peOI: number; ceLtp: number; peLtp: number
+      callVol: number; putVol: number; painAtStrike: number
+    }>
+    maxPainStrike: number; maxPainPull: number; pcr: number
+    totalCallOI: number; totalPutOI: number; atmStrike: number
+  }
+  elliottWave?: EWState | null
+  elliottWaveByTF?: Record<string, EWState>
 }
 
 interface ConvictionResult {
@@ -168,6 +190,29 @@ interface Check {
 }
 
 const MIN_PATTERN_N = 20
+
+interface KalmanBiasState {
+  bias: number; P: number; innovVar: number
+  correctedMove: number; sigma: number
+  nResolved: number; rmse: number; hitRate: number
+}
+function computeKalmanBias(sysLog: SysLogEntry[], rawPredMove: number): KalmanBiasState | null {
+  const resolved = [...sysLog].filter(e => e.resolved && e.outcomeMove != null).sort((a, b) => a.cycleTs - b.cycleTs)
+  if (resolved.length < 5) return null
+  const Q = 1e-5; let x = 0, P = 0.01, innovVarEMA = 0.04
+  const alpha = 0.25; let sumSq = 0, hitCount = 0
+  for (const e of resolved) {
+    const innov = e.outcomeMove! - e.predMove
+    innovVarEMA = alpha * innov * innov + (1 - alpha) * innovVarEMA
+    const R = Math.max(innovVarEMA, 1e-5)
+    const Ppred = P + Q; const K = Ppred / (Ppred + R)
+    x = x + K * (innov - x); P = (1 - K) * Ppred
+    sumSq += innov * innov
+    if (Math.abs(innov) < 0.3) hitCount++
+  }
+  const n = resolved.length; const R = Math.max(innovVarEMA, 1e-5)
+  return { bias: x, P, innovVar: R, correctedMove: rawPredMove + x, sigma: Math.sqrt(P + R), nResolved: n, rmse: Math.sqrt(sumSq / n), hitRate: hitCount / n }
+}
 
 function computeConviction(s: StockState): ConvictionResult {
   const checks: Check[] = []
@@ -379,8 +424,8 @@ function PositionCardInline({ pos, conviction, n50, stocks }: { pos: Position; c
 
 // ── ConvictionCard ──────────────────────────────────────────────────────────
 
-function ConvictionCard({ stock, conviction, positions, n50 }: {
-  stock: StockEntry; conviction: ConvictionResult; positions: Position[]; n50?: N50State | null
+function ConvictionCard({ stock, conviction, positions, n50, role = 'admin' }: {
+  stock: StockEntry; conviction: ConvictionResult; positions: Position[]; n50?: N50State | null; role?: string
 }) {
   const [expanded, setExpanded] = useState(false)
   const tier = convictionTier(conviction.score, conviction.direction)
@@ -454,8 +499,8 @@ function ConvictionCard({ stock, conviction, positions, n50 }: {
           ))}
         </div>
 
-        {/* Open position alert */}
-        {pos && (
+        {/* Open position alert — admin only */}
+        {pos && role !== 'viewer' && (
           <PositionCardInline pos={pos} conviction={conviction} n50={n50} stocks={[stock]} />
         )}
       </div>
@@ -508,7 +553,7 @@ function ConvictionCard({ stock, conviction, positions, n50 }: {
                     <span style={{ color: pat.move >= 0 ? 'var(--bull)' : 'var(--bear)' }}>
                       {pat.move >= 0 ? '+' : ''}{pat.move.toFixed(2)}%
                     </span>
-                    <span style={{ color: 'var(--text3)' }}>sim:{pat.sim.toFixed(2)} n={pat.n}</span>
+                    {role !== 'viewer' && <span style={{ color: 'var(--text3)' }}>sim:{pat.sim.toFixed(2)} n={pat.n}</span>}
                   </div>
                 )
               })}
@@ -689,6 +734,1071 @@ function SignalRow({ label, bullPct, bearPct, move, detail, dim }: {
   )
 }
 
+// ── N50 Option Chain OI Panel ────────────────────────────────────────────────
+
+function N50ChainPanel({ n50 }: { n50: N50State }) {
+  const [showMenu, setShowMenu] = useState(false)
+  const [menuPos, setMenuPos] = useState({ x: 0, y: 0 })
+  const [showModal, setShowModal] = useState(false)
+  const oi = n50.oiAnalytics
+  if (!oi) return null
+
+  const spot = n50.niftySpot ?? n50.niftyProxy ?? 0
+  const maxOI = Math.max(...oi.strikes.map(s => Math.max(s.ceOI, s.peOI)), 1)
+  const pcrBull = oi.pcr > 1.3
+  const pcrBear = oi.pcr < 0.7
+  const pcrColor = pcrBull ? 'var(--bull)' : pcrBear ? 'var(--bear)' : 'var(--text3)'
+  const pcrLabel = pcrBull ? 'BULL hedges' : pcrBear ? 'BEAR complacency' : 'neutral'
+
+  const handleContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault()
+    setMenuPos({ x: e.clientX, y: e.clientY })
+    setShowMenu(true)
+  }
+
+  return (
+    <>
+      <div
+        onContextMenu={handleContextMenu}
+        style={{ padding: '8px 10px', background: CYB.panel, borderRadius: '6px', border: `1px solid ${CYB.glowBorder}`, display: 'flex', flexDirection: 'column', gap: '6px', cursor: 'context-menu' }}
+      >
+        {/* Header */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: '8px', fontWeight: 700, color: CYB.glow, letterSpacing: '0.15em' }}>{'//OI_CHAIN'}</span>
+          <span style={{ fontSize: '9px', color: 'var(--text3)' }}>ATM ₹{oi.atmStrike}</span>
+          <span style={{ fontSize: '9px', fontWeight: 700, color: pcrColor }}>PCR {oi.pcr.toFixed(2)} {pcrLabel}</span>
+          <span style={{ flex: 1 }} />
+          <span style={{ fontSize: '9px', color: 'var(--mixed)', fontWeight: 700 }}>MAX PAIN ₹{oi.maxPainStrike} ({oi.maxPainPull}%↑)</span>
+        </div>
+
+        {/* OI Table */}
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '10px', minWidth: '480px' }}>
+            <thead>
+              <tr style={{ color: 'var(--text3)', fontSize: '8px', letterSpacing: '0.06em' }}>
+                <td style={{ padding: '2px 6px', textAlign: 'right' }}>CE OI</td>
+                <td style={{ padding: '2px 6px', textAlign: 'right' }}>CE LTP</td>
+                <td style={{ padding: '2px 6px', textAlign: 'center', fontWeight: 700 }}>STRIKE</td>
+                <td style={{ padding: '2px 6px', textAlign: 'left' }}>PE LTP</td>
+                <td style={{ padding: '2px 6px', textAlign: 'left' }}>PE OI</td>
+              </tr>
+            </thead>
+            <tbody>
+              {oi.strikes.map(s => {
+                const isATM = s.strike === oi.atmStrike
+                const isMaxPain = s.strike === oi.maxPainStrike
+                const ceBarW = Math.round((s.ceOI / maxOI) * 60)
+                const peBarW = Math.round((s.peOI / maxOI) * 60)
+                const rowBg = isMaxPain ? 'rgba(234,179,8,0.08)' : isATM ? 'rgba(0,255,159,0.05)' : 'transparent'
+                const strikeFontColor = isMaxPain ? 'var(--mixed)' : isATM ? CYB.glow : 'var(--text)'
+                const ceColor = s.ceOI > s.peOI ? 'var(--bear)' : 'var(--text3)'
+                const peColor = s.peOI > s.ceOI ? 'var(--bull)' : 'var(--text3)'
+                return (
+                  <tr key={s.strike} style={{ background: rowBg }}>
+                    <td style={{ padding: '2px 6px', textAlign: 'right' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '4px' }}>
+                        <span style={{ color: ceColor, fontSize: '9px' }}>{(s.ceOI / 1000).toFixed(0)}K</span>
+                        <div style={{ width: `${ceBarW}px`, height: '6px', background: 'rgba(239,68,68,0.4)', borderRadius: '2px', minWidth: '2px' }} />
+                      </div>
+                    </td>
+                    <td style={{ padding: '2px 6px', textAlign: 'right', color: 'var(--bear)', fontSize: '9px' }}>₹{s.ceLtp.toFixed(1)}</td>
+                    <td style={{ padding: '2px 6px', textAlign: 'center', fontWeight: 700, color: strikeFontColor, fontSize: '10px' }}>
+                      {isMaxPain ? '🎯' : ''}{s.strike}{isATM ? ' ◉' : ''}
+                    </td>
+                    <td style={{ padding: '2px 6px', textAlign: 'left', color: 'var(--bull)', fontSize: '9px' }}>₹{s.peLtp.toFixed(1)}</td>
+                    <td style={{ padding: '2px 6px', textAlign: 'left' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <div style={{ width: `${peBarW}px`, height: '6px', background: 'rgba(34,197,94,0.4)', borderRadius: '2px', minWidth: '2px' }} />
+                        <span style={{ color: peColor, fontSize: '9px' }}>{(s.peOI / 1000).toFixed(0)}K</span>
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Footer */}
+        <div style={{ display: 'flex', gap: '12px', fontSize: '8px', color: 'var(--text3)', borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '4px' }}>
+          <span>Total CE OI: <span style={{ color: 'var(--bear)' }}>{(oi.totalCallOI / 100000).toFixed(1)}L</span></span>
+          <span>Total PE OI: <span style={{ color: 'var(--bull)' }}>{(oi.totalPutOI / 100000).toFixed(1)}L</span></span>
+          <span style={{ opacity: 0.5 }}>right-click for explanation</span>
+        </div>
+      </div>
+
+      {/* Context menu */}
+      {showMenu && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 7999 }} onClick={() => setShowMenu(false)}>
+          <div style={{
+            position: 'fixed', left: menuPos.x, top: menuPos.y, zIndex: 8000,
+            background: 'var(--bg)', border: `1px solid ${CYB.glowBorder}`,
+            borderRadius: '6px', padding: '4px', minWidth: '160px', boxShadow: '0 4px 20px rgba(0,0,0,0.6)',
+          }} onClick={e => e.stopPropagation()}>
+            <button
+              style={{ display: 'block', width: '100%', textAlign: 'left', background: 'none', border: 'none', cursor: 'pointer', padding: '5px 12px', fontSize: '11px', color: 'var(--text)', borderRadius: '3px' }}
+              onMouseEnter={e => (e.currentTarget.style.background = 'rgba(255,255,255,0.08)')}
+              onMouseLeave={e => (e.currentTarget.style.background = 'none')}
+              onClick={() => { setShowModal(true); setShowMenu(false) }}
+            >
+              📖 Explain this analysis
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Explanation modal */}
+      {showModal && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 9000, background: 'rgba(0,0,0,0.82)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '12px' }}
+          onClick={e => { if (e.target === e.currentTarget) setShowModal(false) }}>
+          <div style={{ background: 'var(--bg)', border: `1px solid ${CYB.glowBorder}`, borderRadius: '10px', maxWidth: '560px', width: '100%', maxHeight: '88vh', overflowY: 'auto', padding: '18px 20px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+              <div>
+                <div style={{ fontSize: '8px', fontWeight: 700, color: CYB.glow, letterSpacing: '0.15em', marginBottom: '4px' }}>{'//OI_CHAIN  ·  EXPLANATION'}</div>
+                <div style={{ fontSize: '14px', fontWeight: 800, color: 'var(--text)' }}>Option Chain OI Analysis</div>
+              </div>
+              <button style={{ background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '5px', color: 'var(--text2)', cursor: 'pointer', fontSize: '11px', padding: '3px 10px' }} onClick={() => setShowModal(false)}>✕ close</button>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', fontSize: '11px', color: 'var(--text2)', lineHeight: 1.6 }}>
+              <div>
+                <div style={{ fontSize: '9px', fontWeight: 700, color: CYB.glow, letterSpacing: '0.12em', marginBottom: '4px' }}>MAX PAIN (Nash Equilibrium)</div>
+                <p>Max Pain is the strike price at which total losses to option writers are minimized. Because option writers (typically institutions/market makers) hold far more premium than buyers, there is a structural gravity toward this price near expiry. It acts as a Nash Equilibrium: each writer's position exerts force pulling price toward max pain. With current max pain at ₹{oi.maxPainStrike} (pull strength {oi.maxPainPull}%), there is a {oi.maxPainPull}% steeper pain gradient at adjacent strikes vs the minimum — the stronger this number, the greater the magnetic pull.</p>
+              </div>
+              <div>
+                <div style={{ fontSize: '9px', fontWeight: 700, color: CYB.glow, letterSpacing: '0.12em', marginBottom: '4px' }}>PUT/CALL RATIO (PCR = {oi.pcr.toFixed(2)})</div>
+                <p>PCR = Total Put OI / Total Call OI. Interpretation (contrarian): high PCR (&gt;1.3) means more put buying = fear/hedging = markets often reverse up (sellers are hedged, bounce likely). Low PCR (&lt;0.7) means complacency = markets often fall. Neutral range (0.7–1.3) = balanced positioning, take direction from microstructure signals.</p>
+              </div>
+              <div>
+                <div style={{ fontSize: '9px', fontWeight: 700, color: CYB.glow, letterSpacing: '0.12em', marginBottom: '4px' }}>OI WALLS AS SCHELLING FOCAL POINTS</div>
+                <p>Large OI at a strike creates a Schelling Point — a level that participants naturally focus on without coordination. Writers who sold calls at ₹X will defend that level by delta-hedging (buying the underlying as price approaches). Writers who sold puts at ₹Y will defend that level by selling the underlying as price approaches. This creates two-way attraction that forms range-bound behavior and makes breakouts more meaningful when they occur.</p>
+              </div>
+              <div>
+                <div style={{ fontSize: '9px', fontWeight: 700, color: CYB.glow, letterSpacing: '0.12em', marginBottom: '4px' }}>HOW TO READ THE CHAIN</div>
+                <p>1. Find ATM (◉): this is where the most theta decay and gamma risk lives. 2. Find max pain (🎯): likely gravitational target before expiry. 3. Look for the largest OI walls: these act as resistance (call OI) and support (put OI). 4. Spot divergence: if call OI far exceeds put OI at and above ATM, writers are positioned for downside protection — follow their delta-hedging. 5. Combine with PCR for direction bias.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  )
+}
+
+// ── N50 Game Theory Panel (admin only) ──────────────────────────────────────
+
+interface N50GTAnalysis {
+  maxPainStrike: number | null
+  maxPainDir: 'BULL' | 'BEAR' | 'NEUTRAL' | null
+  maxPainDistPct: number | null
+  maxPainPull: number
+  pcr: number | null
+  pcrSignal: 'BULL' | 'BEAR' | 'NEUTRAL' | null
+  pcrInterp: string
+  callWallStrike: number | null
+  callWallOI: number
+  putWallStrike: number | null
+  putWallOI: number
+  wallPosition: 'ABOVE_RESISTANCE' | 'BELOW_SUPPORT' | 'IN_RANGE' | null
+  wallRangeUsed: number
+  regime: 'ACCUMULATION' | 'MARKUP' | 'DISTRIBUTION' | 'MARKDOWN' | 'CHOP' | 'UNKNOWN'
+  oracleAlignment: 'ALIGNED' | 'DIVERGING' | 'NEUTRAL' | null
+  microDir: 'BULL' | 'BEAR' | 'NEUTRAL'
+  gtScore: number
+  gtDirection: 'BULL' | 'BEAR' | 'NEUTRAL'
+  gtConviction: 'HIGH' | 'MEDIUM' | 'LOW'
+  components: { mpC: number; pcrC: number; schC: number; orcC: number; microC: number }
+  oracleTarget: number | null
+  oracleTargetPct: number | null
+  nashTarget: number | null
+  nashTargetPct: number | null
+  gtTarget: number | null
+  gtTargetPct: number | null
+}
+
+function computeN50GT(n50: N50State): N50GTAnalysis {
+  const comp = n50.composite
+  const tech = n50.technicals
+  const oi = n50.oiAnalytics
+  const spot = n50.niftySpot ?? 0
+
+  // ── 1. Max Pain (Nash Equilibrium gravity) ────────────────────────────────
+  const mpStrike = oi?.maxPainStrike ?? null
+  const mpPull   = oi?.maxPainPull   ?? 0
+  let mpDir: N50GTAnalysis['maxPainDir'] = null
+  let mpDistPct: number | null = null
+  let mpC = 0
+  if (mpStrike != null && spot > 0) {
+    mpDistPct = (mpStrike - spot) / spot * 100
+    mpDir = mpDistPct > 0.15 ? 'BULL' : mpDistPct < -0.15 ? 'BEAR' : 'NEUTRAL'
+    const pullNorm = Math.min(1, mpPull / 30)
+    mpC = Math.max(-1, Math.min(1, (mpDistPct / 1.5) * pullNorm))
+  }
+
+  // ── 2. PCR (Kyle costly signal) ──────────────────────────────────────────
+  const pcr = oi?.pcr ?? null
+  let pcrSignal: N50GTAnalysis['pcrSignal'] = null
+  let pcrInterp = ''
+  let pcrC = 0
+  if (pcr != null) {
+    if (pcr >= 1.5)      { pcrSignal = 'BEAR'; pcrInterp = 'Heavy put buying — bears paying real premium (costly signal)'; pcrC = -Math.min(1, (pcr - 1) * 0.7) }
+    else if (pcr >= 1.2) { pcrSignal = 'BEAR'; pcrInterp = 'Moderate put bias — downside hedging elevated'; pcrC = -0.35 }
+    else if (pcr <= 0.6) { pcrSignal = 'BULL'; pcrInterp = 'Heavy call buying — bulls paying real premium (costly signal)'; pcrC = Math.min(1, (1 - pcr) * 0.7) }
+    else if (pcr <= 0.8) { pcrSignal = 'BULL'; pcrInterp = 'Moderate call bias — upside speculation elevated'; pcrC = 0.35 }
+    else                 { pcrSignal = 'NEUTRAL'; pcrInterp = 'Balanced options market — no informed directional bias' }
+  }
+
+  // ── 3. Schelling Focal Points (max-OI walls as coordination anchors) ──────
+  const strikes = oi?.strikes ?? []
+  let callWallStrike: number | null = null; let callWallOI = 0
+  let putWallStrike:  number | null = null; let putWallOI  = 0
+  let wallPosition: N50GTAnalysis['wallPosition'] = null
+  let wallRangeUsed = 0.5
+  let schC = 0
+  if (strikes.length > 0 && spot > 0) {
+    const maxCall = strikes.reduce((b, s) => s.ceOI > b.ceOI ? s : b)
+    const maxPut  = strikes.reduce((b, s) => s.peOI > b.peOI ? s : b)
+    callWallStrike = maxCall.strike; callWallOI = maxCall.ceOI
+    putWallStrike  = maxPut.strike;  putWallOI  = maxPut.peOI
+    if (spot > callWallStrike) {
+      wallPosition = 'ABOVE_RESISTANCE'; wallRangeUsed = 1; schC = 0.8
+    } else if (spot < putWallStrike) {
+      wallPosition = 'BELOW_SUPPORT'; wallRangeUsed = 0; schC = -0.8
+    } else {
+      wallPosition = 'IN_RANGE'
+      const rangeW = callWallStrike - putWallStrike || 1
+      wallRangeUsed = (spot - putWallStrike) / rangeW
+      schC = (wallRangeUsed - 0.5) * -0.6
+    }
+  }
+
+  // ── 4. Regime from N50 microstructure ─────────────────────────────────────
+  const avgCdZ = tech.avgCdZ
+  const avgImb = tech.avgImbalance
+  let regime: N50GTAnalysis['regime']
+  if      (avgCdZ > 0.5 && avgImb < 0.1)  regime = 'ACCUMULATION'
+  else if (avgCdZ > 0.5 && avgImb >= 0.1) regime = 'MARKUP'
+  else if (avgCdZ < -0.5 && avgImb > -0.1) regime = 'DISTRIBUTION'
+  else if (avgCdZ < -0.5 && avgImb <= -0.1) regime = 'MARKDOWN'
+  else if (Math.abs(avgCdZ) < 0.3)         regime = 'CHOP'
+  else                                      regime = 'UNKNOWN'
+  const regimeMult = regime === 'CHOP' ? 0.5 : 1.0
+
+  // ── 5. Oracle contribution ────────────────────────────────────────────────
+  const orcC = comp.direction === 'BULL'
+    ? comp.confidence
+    : comp.direction === 'BEAR' ? -comp.confidence : 0
+
+  // ── 6. Microstructure (N50-specific: CD Z-score + CUSUM) ─────────────────
+  // This is the improvement over crude: direct access to order-flow data
+  const cdNorm = Math.max(-1, Math.min(1, avgCdZ / 3))
+  const cusumTotal = tech.cusumBullCount + tech.cusumBearCount
+  const cusumNorm = cusumTotal > 0
+    ? (tech.cusumBullCount - tech.cusumBearCount) / cusumTotal : 0
+  const microC = (cdNorm + cusumNorm) / 2
+  const microDir: N50GTAnalysis['microDir'] =
+    microC > 0.15 ? 'BULL' : microC < -0.15 ? 'BEAR' : 'NEUTRAL'
+
+  // ── 7. Weighted GT score ──────────────────────────────────────────────────
+  // Weights sum to 1.0: microstructure (0.20) replaces part of oracle weight vs crude
+  const w = { mp: 0.20, pcr: 0.20, sch: 0.15, orc: 0.25, micro: 0.20 }
+  const gtScore = regimeMult * (w.mp * mpC + w.pcr * pcrC + w.sch * schC)
+    + w.orc * orcC + w.micro * microC
+  const clamped = Math.max(-1, Math.min(1, gtScore))
+  const gtDirection: N50GTAnalysis['gtDirection'] =
+    clamped > 0.15 ? 'BULL' : clamped < -0.15 ? 'BEAR' : 'NEUTRAL'
+  const absScore = Math.abs(clamped)
+  const gtConviction: N50GTAnalysis['gtConviction'] =
+    absScore > 0.5 ? 'HIGH' : absScore > 0.25 ? 'MEDIUM' : 'LOW'
+
+  const oracleAlignment: N50GTAnalysis['oracleAlignment'] =
+    comp.direction == null ? null :
+    comp.direction === gtDirection ? 'ALIGNED' :
+    gtDirection === 'NEUTRAL' ? 'NEUTRAL' : 'DIVERGING'
+
+  // ── 8. Price prediction ───────────────────────────────────────────────────
+  const oracleTarget = spot > 0 && comp.predictedMove != null
+    ? spot * (1 + comp.predictedMove / 100) : null
+  const oracleTargetPct = oracleTarget != null ? comp.predictedMove : null
+  const nashTarget = mpStrike ?? null
+  const nashTargetPct = (nashTarget != null && spot > 0) ? (nashTarget - spot) / spot * 100 : null
+
+  let gtTarget: number | null = null
+  let gtTargetPct: number | null = null
+  if (spot > 0 && gtDirection !== 'NEUTRAL') {
+    const isBull = gtDirection === 'BULL'
+    const orcW = (isBull ? orcC > 0 : orcC < 0) ? Math.abs(orcC) : 0
+    const mpW  = (isBull ? mpC  > 0 : mpC  < 0) ? Math.abs(mpC)  : 0
+    const total = orcW + mpW
+    if (total > 0 && oracleTarget != null && nashTarget != null) {
+      gtTarget = (oracleTarget * orcW + nashTarget * mpW) / total
+    } else if (orcW > 0 && oracleTarget != null) {
+      gtTarget = oracleTarget
+    } else if (mpW > 0 && nashTarget != null) {
+      gtTarget = nashTarget
+    }
+    if (gtTarget != null) {
+      gtTargetPct = (gtTarget - spot) / spot * 100
+      if ((isBull && gtTargetPct <= 0) || (!isBull && gtTargetPct >= 0)) {
+        gtTarget = null
+        gtTargetPct = null
+      }
+    }
+  }
+
+  return {
+    maxPainStrike: mpStrike, maxPainDir: mpDir, maxPainDistPct: mpDistPct, maxPainPull: mpPull,
+    pcr, pcrSignal, pcrInterp,
+    callWallStrike, callWallOI, putWallStrike, putWallOI, wallPosition, wallRangeUsed,
+    regime, oracleAlignment, microDir,
+    gtScore: clamped, gtDirection, gtConviction,
+    components: { mpC, pcrC, schC, orcC, microC },
+    oracleTarget, oracleTargetPct, nashTarget, nashTargetPct, gtTarget, gtTargetPct,
+  }
+}
+
+function N50GTExplanationModal({ gt, n50, onClose }: { gt: N50GTAnalysis; n50: N50State; onClose: () => void }) {
+  const spot = n50.niftySpot ?? 0
+  const gtColor = gt.gtDirection === 'BULL' ? 'var(--bull)' : gt.gtDirection === 'BEAR' ? 'var(--bear)' : 'var(--text3)'
+  const convColor = gt.gtConviction === 'HIGH' ? '#eab308' : gt.gtConviction === 'MEDIUM' ? 'var(--text2)' : 'var(--text3)'
+  const regimeEmoji: Record<string, string> = { ACCUMULATION: '📦', MARKUP: '🚀', DISTRIBUTION: '📤', MARKDOWN: '📉', CHOP: '〰️', UNKNOWN: '❓' }
+  const S: Record<string, React.CSSProperties> = {
+    overlay: { position: 'fixed', inset: 0, zIndex: 9500, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '12px' },
+    modal: { background: 'var(--bg)', border: `1px solid ${CYB.glowBorder}`, borderRadius: '10px', maxWidth: '600px', width: '100%', maxHeight: '90vh', overflowY: 'auto', padding: '18px 20px', display: 'flex', flexDirection: 'column', gap: '14px' },
+    sec: { display: 'flex', flexDirection: 'column', gap: '5px', paddingBottom: '12px', borderBottom: '1px solid rgba(255,255,255,0.05)' },
+    secTitle: { fontSize: '9px', fontWeight: 700, color: CYB.glow, letterSpacing: '0.12em', marginBottom: '2px' } as React.CSSProperties,
+    body: { fontSize: '11px', color: 'var(--text2)', lineHeight: 1.6 } as React.CSSProperties,
+    row: { display: 'flex', alignItems: 'baseline', gap: '8px', flexWrap: 'wrap' } as React.CSSProperties,
+    closeBtn: { background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '5px', color: 'var(--text2)', cursor: 'pointer', fontSize: '11px', padding: '3px 10px', flexShrink: 0 } as React.CSSProperties,
+  }
+  const chip = (c: string): React.CSSProperties => ({ display: 'inline-block', fontSize: '9px', padding: '2px 6px', borderRadius: '3px', fontWeight: 700, background: `${c}22`, border: `1px solid ${c}44`, color: c })
+  const compBar = (label: string, val: number, weight: number) => {
+    const c = val > 0 ? 'var(--bull)' : val < 0 ? 'var(--bear)' : 'var(--text3)'
+    const contrib = val * weight
+    return (
+      <div key={label} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '10px' }}>
+        <span style={{ width: '80px', color: 'var(--text3)', textAlign: 'right' }}>{label}</span>
+        <div style={{ position: 'relative', width: '120px', height: '8px', background: 'rgba(255,255,255,0.06)', borderRadius: '4px' }}>
+          <div style={{ position: 'absolute', top: 0, height: '100%', width: `${Math.abs(val) * 60}px`, [val >= 0 ? 'left' : 'right']: '50%', background: c, borderRadius: '4px', maxWidth: '50%' }} />
+          <div style={{ position: 'absolute', top: 0, left: '50%', width: '1px', height: '100%', background: 'rgba(255,255,255,0.2)' }} />
+        </div>
+        <span style={{ color: c, fontWeight: 700, minWidth: '40px' }}>{val >= 0 ? '+' : ''}{val.toFixed(2)}</span>
+        <span style={{ color: 'var(--text3)' }}>×{weight}</span>
+        <span style={{ color: contrib > 0 ? 'var(--bull)' : contrib < 0 ? 'var(--bear)' : 'var(--text3)', fontWeight: 700 }}>= {contrib >= 0 ? '+' : ''}{contrib.toFixed(3)}</span>
+      </div>
+    )
+  }
+
+  return (
+    <div style={S.overlay} onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div style={S.modal}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+          <div>
+            <div style={{ fontSize: '8px', fontWeight: 700, color: CYB.glow, letterSpacing: '0.15em' }}>{'//GT_ENGINE  ·  NIFTY 50  ·  EXPLANATION'}</div>
+            <div style={{ fontSize: '14px', fontWeight: 900, color: gtColor, marginTop: '4px' }}>{gt.gtDirection} — {gt.gtConviction} CONVICTION</div>
+            <div style={{ fontSize: '10px', color: 'var(--text3)', marginTop: '2px' }}>
+              spot ₹{spot.toFixed(0)}  ·  GT score: {gt.gtScore >= 0 ? '+' : ''}{gt.gtScore.toFixed(3)}  ·  regime: {regimeEmoji[gt.regime]} {gt.regime}
+            </div>
+          </div>
+          <button style={S.closeBtn} onClick={onClose}>✕ close</button>
+        </div>
+
+        <div style={S.sec}>
+          <div style={S.secTitle}>WHAT IS GT ENGINE?</div>
+          <div style={S.body}>Five game-theoretic signals synthesised into one conviction score −1..+1. Unlike the Oracle (statistical pattern memory), GT measures whether the current moment has institutional fingerprints across five independent dimensions. N50 adds a microstructure layer (CD + CUSUM) unavailable in commodity markets.</div>
+        </div>
+
+        <div style={S.sec}>
+          <div style={S.secTitle}>① MAX PAIN — NASH EQUILIBRIUM (weight 20%)</div>
+          <div style={S.row}>
+            <span style={{ fontSize: '12px', fontWeight: 700, color: gt.maxPainDir === 'BULL' ? 'var(--bull)' : gt.maxPainDir === 'BEAR' ? 'var(--bear)' : 'var(--text3)' }}>{gt.maxPainDir ?? 'NO DATA'}</span>
+            {gt.maxPainStrike != null && <span style={{ fontSize: '10px', color: 'var(--text2)' }}>₹{gt.maxPainStrike.toFixed(0)} ({gt.maxPainDistPct != null ? `spot ${gt.maxPainDistPct > 0 ? '+' : ''}${gt.maxPainDistPct.toFixed(2)}% away` : '—'})</span>}
+            {gt.maxPainPull > 0 && <span style={chip(gt.maxPainPull >= 15 ? '#eab308' : 'var(--text3)')}>pull:{gt.maxPainPull.toFixed(1)}%</span>}
+          </div>
+          <div style={S.body}>The strike price where option writers collectively lose the least. Every writer delta-hedges toward this level — not by conspiracy but because it is the Nash Equilibrium of the hedging game. Pull % measures the steepness of the pain gradient at adjacent strikes — higher pull = stronger gravitational force.</div>
+          {gt.maxPainStrike == null && <div style={{ fontSize: '10px', color: 'var(--text3)', fontStyle: 'italic' }}>OI chain data not yet loaded</div>}
+        </div>
+
+        <div style={S.sec}>
+          <div style={S.secTitle}>② PCR — KYLE COSTLY SIGNAL (weight 20%)</div>
+          <div style={S.row}>
+            <span style={{ fontSize: '12px', fontWeight: 700, color: gt.pcrSignal === 'BULL' ? 'var(--bull)' : gt.pcrSignal === 'BEAR' ? 'var(--bear)' : 'var(--text3)' }}>{gt.pcrSignal ?? 'NO DATA'}</span>
+            {gt.pcr != null && <span style={{ fontSize: '10px', color: 'var(--text2)' }}>PCR: {gt.pcr.toFixed(2)}</span>}
+          </div>
+          <div style={S.body}>{gt.pcrInterp || 'No PCR data available.'} Buying a put/call requires paying real premium that is lost if wrong — a costly signal in the Kyle (1985) sense. High PCR (≥1.2) = money committed to downside = informed bearish hedging. Contrast with the order book where walls are free to place and pull.</div>
+        </div>
+
+        <div style={S.sec}>
+          <div style={S.secTitle}>③ SCHELLING FOCAL POINTS — OI WALLS (weight 15%)</div>
+          {gt.callWallStrike != null && gt.putWallStrike != null ? (
+            <>
+              <div style={S.row}>
+                <span style={chip('var(--bear)')}>CALL WALL ₹{gt.callWallStrike.toFixed(0)}</span>
+                <span style={{ fontSize: '10px', color: 'var(--text3)' }}>{(gt.callWallOI / 1000).toFixed(0)}K OI — resistance ceiling</span>
+              </div>
+              <div style={S.row}>
+                <span style={chip('var(--bull)')}>PUT WALL ₹{gt.putWallStrike.toFixed(0)}</span>
+                <span style={{ fontSize: '10px', color: 'var(--text3)' }}>{(gt.putWallOI / 1000).toFixed(0)}K OI — support floor</span>
+              </div>
+              <div style={{ marginTop: '4px', fontSize: '10px', color: gt.wallPosition === 'ABOVE_RESISTANCE' ? 'var(--bull)' : gt.wallPosition === 'BELOW_SUPPORT' ? 'var(--bear)' : 'var(--text3)' }}>
+                Spot ₹{spot.toFixed(0)}: {gt.wallPosition === 'ABOVE_RESISTANCE' ? '↑ ABOVE resistance — bullish breakout' : gt.wallPosition === 'BELOW_SUPPORT' ? '↓ BELOW support — bearish breakdown' : `IN RANGE (${(gt.wallRangeUsed * 100).toFixed(0)}% used from put wall)`}
+              </div>
+            </>
+          ) : <div style={{ fontSize: '10px', color: 'var(--text3)', fontStyle: 'italic' }}>OI chain data not yet loaded</div>}
+          <div style={S.body}>Strikes with large OI become Schelling Points — natural coordination anchors. Call wall writers delta-hedge above (suppress price). Put wall writers defend below (support price). Breaking a wall triggers cascade exits from the losing side.</div>
+        </div>
+
+        <div style={S.sec}>
+          <div style={S.secTitle}>④ ORACLE (weight 25%)</div>
+          <div style={S.body}>The Oracle is the softmax kNN pattern memory (N={n50.snapshotCount} snapshots). It is statistically independent of the three OI signals above. When all four components agree in direction, GT score approaches ±1. Oracle divergence pulls the score toward NEUTRAL.</div>
+        </div>
+
+        <div style={S.sec}>
+          <div style={S.secTitle}>⑤ MICROSTRUCTURE — CD + CUSUM (weight 20%, N50-specific)</div>
+          <div style={S.row}>
+            <span style={{ fontSize: '12px', fontWeight: 700, color: gt.microDir === 'BULL' ? 'var(--bull)' : gt.microDir === 'BEAR' ? 'var(--bear)' : 'var(--text3)' }}>{gt.microDir}</span>
+            <span style={{ fontSize: '10px', color: 'var(--text2)' }}>avgCdZ: {n50.technicals.avgCdZ.toFixed(2)}σ  ·  CUSUM B:{n50.technicals.cusumBullCount} / Bear:{n50.technicals.cusumBearCount}</span>
+          </div>
+          <div style={S.body}>Live order-flow data unavailable in commodity GT panels — this is the N50 improvement. Cumulative Delta Z-score measures net buy/sell pressure from actual trade prints (unfakeable). CUSUM detects sustained regime shifts rather than single noisy ticks. Together they confirm whether institutions are actively positioned in the GT direction.</div>
+        </div>
+
+        <div style={S.sec}>
+          <div style={S.secTitle}>⑥ REGIME: {regimeEmoji[gt.regime]} {gt.regime} (multiplier applied)</div>
+          <div style={S.body}>
+            {gt.regime === 'ACCUMULATION' && 'CD positive but book not yet bullish — institution buying in stealth. Follow CD, not OBI. CHOP multiplier = 1.0.'}
+            {gt.regime === 'MARKUP' && 'CD positive AND book bullish — momentum phase. Institution done hiding, now running price. Full conviction.'}
+            {gt.regime === 'DISTRIBUTION' && 'CD negative but book not yet bearish — institution selling quietly. Follow CD over displayed walls.'}
+            {gt.regime === 'MARKDOWN' && 'CD negative AND book bearish — visible selling phase. High conviction BEAR.'}
+            {gt.regime === 'CHOP' && 'No dominant player. CD weak, book noisy. OI signals halved (0.5× multiplier) — only microstructure and oracle count at full weight.'}
+            {gt.regime === 'UNKNOWN' && 'Intermediate state — CD and OBI partially conflicting. Both directions carry uncertainty.'}
+          </div>
+        </div>
+
+        <div style={{ ...S.sec, borderBottom: 'none', paddingBottom: 0 }}>
+          <div style={S.secTitle}>COMPONENT BREAKDOWN</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '4px' }}>
+            {compBar('Max Pain',    gt.components.mpC,    0.20)}
+            {compBar('PCR',        gt.components.pcrC,   0.20)}
+            {compBar('OI Walls',   gt.components.schC,   0.15)}
+            {compBar('Oracle',     gt.components.orcC,   0.25)}
+            {compBar('Micro CD+C', gt.components.microC, 0.20)}
+          </div>
+          <div style={{ marginTop: '10px', display: 'flex', alignItems: 'baseline', gap: '8px' }}>
+            <span style={{ fontSize: '10px', color: 'var(--text3)' }}>GT SCORE</span>
+            <span style={{ fontSize: '16px', fontWeight: 900, color: gtColor }}>{gt.gtScore >= 0 ? '+' : ''}{gt.gtScore.toFixed(3)}</span>
+            <span style={{ fontSize: '10px', color: convColor, fontWeight: 700 }}>{gt.gtConviction} CONVICTION</span>
+          </div>
+          <div style={{ fontSize: '9px', color: 'var(--text3)', marginTop: '4px', lineHeight: 1.5 }}>
+            Score −1 (strong BEAR) to +1 (strong BULL). HIGH = |score| &gt; 0.5. MEDIUM = 0.25–0.5. LOW = &lt; 0.25. In CHOP regime, OI signal weights are halved.
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function N50GTPanel({ n50 }: { n50: N50State }) {
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null)
+  const [showModal, setShowModal] = useState(false)
+
+  useEffect(() => {
+    const close = () => setCtxMenu(null)
+    window.addEventListener('click', close)
+    return () => window.removeEventListener('click', close)
+  }, [])
+  useEffect(() => {
+    if (!showModal) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setShowModal(false) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [showModal])
+
+  const gt = computeN50GT(n50)
+  const spot = n50.niftySpot ?? 0
+  const gtColor = gt.gtDirection === 'BULL' ? 'var(--bull)' : gt.gtDirection === 'BEAR' ? 'var(--bear)' : 'var(--text3)'
+  const convColor = gt.gtConviction === 'HIGH' ? '#eab308' : gt.gtConviction === 'MEDIUM' ? 'var(--text2)' : 'var(--text3)'
+  const regimeEmoji: Record<string, string> = { ACCUMULATION: '📦', MARKUP: '🚀', DISTRIBUTION: '📤', MARKDOWN: '📉', CHOP: '〰️', UNKNOWN: '❓' }
+  const regimeColor = ['MARKUP', 'ACCUMULATION'].includes(gt.regime) ? 'var(--bull)' :
+    ['MARKDOWN', 'DISTRIBUTION'].includes(gt.regime) ? 'var(--bear)' :
+    gt.regime === 'CHOP' ? 'var(--text3)' : 'rgba(255,255,255,0.25)'
+
+  const noOI = !n50.oiAnalytics
+  const scoreBarW = 160
+  const scoreFill = Math.abs(gt.gtScore) * (scoreBarW / 2)
+
+  const compRow = (label: string, val: number, signal: string | null, sigColor: string, extra?: string) => (
+    <div key={label} style={{ display: 'grid', gridTemplateColumns: '90px 1fr 90px', alignItems: 'center', gap: '6px', fontSize: '10px' }}>
+      <span style={{ color: 'var(--text3)', textAlign: 'right' }}>{label}</span>
+      <div style={{ position: 'relative', height: '6px', background: 'rgba(255,255,255,0.06)', borderRadius: '3px' }}>
+        <div style={{ position: 'absolute', top: 0, height: '100%', background: val > 0 ? 'var(--bull)' : val < 0 ? 'var(--bear)' : 'rgba(255,255,255,0.15)', borderRadius: '3px', width: `${Math.abs(val) * 50}%`, [val >= 0 ? 'left' : 'right']: '50%', maxWidth: '50%' }} />
+        <div style={{ position: 'absolute', top: 0, left: '50%', width: '1px', height: '100%', background: 'rgba(255,255,255,0.15)' }} />
+      </div>
+      <span style={{ color: sigColor, fontWeight: 700, fontSize: '9px' }}>{signal ?? '—'}{extra ? ` ${extra}` : ''}</span>
+    </div>
+  )
+
+  return (
+    <>
+      <div
+        onContextMenu={e => { e.preventDefault(); setCtxMenu({ x: e.clientX, y: e.clientY }) }}
+        style={{ padding: '8px 10px', background: CYB.panel, borderRadius: '6px', border: `1px solid ${CYB.glowBorder}`, display: 'flex', flexDirection: 'column', gap: '8px', cursor: 'context-menu' }}
+      >
+        {/* Header */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: '8px', fontWeight: 700, color: CYB.glow, letterSpacing: '0.15em' }}>{'//GT_ENGINE'}</span>
+          <span style={{ fontSize: '8px', color: '#eab308', border: `1px solid ${'#eab308'}44`, borderRadius: '3px', padding: '0 4px', fontWeight: 700 }}>ADMIN</span>
+          <span style={{ flex: 1 }} />
+          <span style={{ fontSize: '8px', color: 'var(--text3)', opacity: 0.5 }}>right-click to explain</span>
+        </div>
+
+        {/* GT Score row */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: '6px' }}>
+            <span style={{ fontSize: '18px', fontWeight: 900, color: gtColor, lineHeight: 1 }}>{gt.gtDirection}</span>
+            <span style={{ fontSize: '11px', fontWeight: 700, color: convColor }}>{gt.gtConviction}</span>
+          </div>
+          <div style={{ position: 'relative', width: `${scoreBarW}px`, height: '8px', background: 'rgba(255,255,255,0.06)', borderRadius: '4px', flexShrink: 0 }}>
+            <div style={{ position: 'absolute', top: 0, height: '100%', width: `${scoreFill}px`, background: gtColor, borderRadius: '4px', [gt.gtScore >= 0 ? 'left' : 'right']: '50%', maxWidth: '50%' }} />
+            <div style={{ position: 'absolute', top: 0, left: '50%', width: '1px', height: '100%', background: 'rgba(255,255,255,0.2)' }} />
+          </div>
+          <span style={{ fontSize: '10px', color: 'var(--text3)' }}>{gt.gtScore >= 0 ? '+' : ''}{gt.gtScore.toFixed(3)}</span>
+        </div>
+
+        {/* Price prediction */}
+        {gt.gtTarget != null && gt.gtDirection !== 'NEUTRAL' && (
+          <div style={{ background: 'rgba(255,255,255,0.03)', borderRadius: '4px', padding: '5px 8px', display: 'flex', flexDirection: 'column', gap: '3px' }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '8px', color: 'var(--text3)', letterSpacing: '0.1em', fontWeight: 700 }}>GT TARGET</span>
+              <span style={{ fontSize: '14px', fontWeight: 900, color: gt.gtTargetPct! > 0 ? 'var(--bull)' : 'var(--bear)', lineHeight: 1 }}>
+                ₹{gt.gtTarget.toFixed(0)}
+              </span>
+              <span style={{ fontSize: '11px', fontWeight: 700, color: gt.gtTargetPct! > 0 ? 'var(--bull)' : 'var(--bear)' }}>
+                {gt.gtTargetPct! >= 0 ? '+' : ''}{gt.gtTargetPct!.toFixed(2)}%
+              </span>
+            </div>
+            <div style={{ display: 'flex', gap: '8px', fontSize: '9px', color: 'var(--text3)', flexWrap: 'wrap' }}>
+              {gt.oracleTargetPct != null && (
+                <span>oracle {gt.oracleTargetPct >= 0 ? '+' : ''}{gt.oracleTargetPct.toFixed(2)}% → ₹{gt.oracleTarget!.toFixed(0)}</span>
+              )}
+              {gt.nashTargetPct != null && (
+                <span>·  nash {gt.nashTargetPct >= 0 ? '+' : ''}{gt.nashTargetPct.toFixed(2)}% → ₹{gt.nashTarget!.toFixed(0)}</span>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Component breakdown */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+          {compRow('max pain', gt.components.mpC,
+            gt.maxPainDir ?? (noOI ? 'no OI' : '—'),
+            gt.maxPainDir === 'BULL' ? 'var(--bull)' : gt.maxPainDir === 'BEAR' ? 'var(--bear)' : 'var(--text3)',
+            gt.maxPainStrike != null ? `₹${gt.maxPainStrike.toFixed(0)} pull:${gt.maxPainPull.toFixed(0)}%` : undefined,
+          )}
+          {compRow('PCR',
+            gt.components.pcrC,
+            gt.pcr != null ? `${gt.pcr.toFixed(2)}` : (noOI ? 'no OI' : '—'),
+            gt.pcrSignal === 'BULL' ? 'var(--bull)' : gt.pcrSignal === 'BEAR' ? 'var(--bear)' : 'var(--text3)',
+            gt.pcrSignal != null && gt.pcrSignal !== 'NEUTRAL' ? `(${gt.pcrSignal})` : undefined,
+          )}
+          {compRow('OI walls',
+            gt.components.schC,
+            gt.wallPosition === 'ABOVE_RESISTANCE' ? '↑BREAK' : gt.wallPosition === 'BELOW_SUPPORT' ? '↓BREAK' : gt.wallPosition === 'IN_RANGE' ? `${(gt.wallRangeUsed * 100).toFixed(0)}%` : (noOI ? 'no OI' : '—'),
+            gt.wallPosition === 'ABOVE_RESISTANCE' ? 'var(--bull)' : gt.wallPosition === 'BELOW_SUPPORT' ? 'var(--bear)' : 'var(--text3)',
+            gt.callWallStrike != null ? `${gt.putWallStrike?.toFixed(0)}–${gt.callWallStrike?.toFixed(0)}` : undefined,
+          )}
+          {compRow('oracle',
+            gt.components.orcC,
+            n50.composite.direction ?? 'NEUTRAL',
+            n50.composite.direction === 'BULL' ? 'var(--bull)' : n50.composite.direction === 'BEAR' ? 'var(--bear)' : 'var(--text3)',
+            `${(n50.composite.confidence * 100).toFixed(0)}%conf`,
+          )}
+          {compRow('micro CD+CUSUM',
+            gt.components.microC,
+            gt.microDir,
+            gt.microDir === 'BULL' ? 'var(--bull)' : gt.microDir === 'BEAR' ? 'var(--bear)' : 'var(--text3)',
+            `cdZ:${n50.technicals.avgCdZ.toFixed(1)}σ`,
+          )}
+        </div>
+
+        {/* Regime + alignment footer */}
+        <div style={{ display: 'flex', gap: '10px', alignItems: 'center', borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '5px', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: '9px', color: 'var(--text3)' }}>regime:</span>
+          <span style={{ fontSize: '9px', fontWeight: 700, color: regimeColor }}>{regimeEmoji[gt.regime]} {gt.regime}</span>
+          {gt.regime === 'CHOP' && <span style={{ fontSize: '8px', color: 'var(--text3)' }}>→ OI weights ½</span>}
+          <span style={{ flex: 1 }} />
+          {gt.oracleAlignment && (
+            <span style={{ fontSize: '9px', fontWeight: 700, color: gt.oracleAlignment === 'ALIGNED' ? 'var(--bull)' : gt.oracleAlignment === 'DIVERGING' ? 'var(--bear)' : 'var(--text3)' }}>
+              {gt.oracleAlignment === 'ALIGNED' ? '✓ ALIGNED' : gt.oracleAlignment === 'DIVERGING' ? '⚠ DIVERGING' : '~ NEUTRAL'}
+            </span>
+          )}
+        </div>
+
+        {noOI && (
+          <div style={{ fontSize: '9px', color: 'var(--text3)', opacity: 0.6, fontStyle: 'italic' }}>
+            max pain + PCR + OI walls pending chain load
+          </div>
+        )}
+      </div>
+
+      {/* Context menu */}
+      {ctxMenu && (
+        <div style={{
+          position: 'fixed', left: ctxMenu.x, top: ctxMenu.y, zIndex: 8500,
+          background: 'var(--bg)', border: `1px solid ${CYB.glowBorder}`,
+          borderRadius: '6px', padding: '4px', minWidth: '210px', boxShadow: '0 4px 20px rgba(0,0,0,0.6)',
+        }} onClick={e => e.stopPropagation()}>
+          <button onClick={() => { setShowModal(true); setCtxMenu(null) }} style={{
+            display: 'block', width: '100%', textAlign: 'left', background: 'none', border: 'none',
+            cursor: 'pointer', padding: '7px 12px', fontSize: '12px', color: 'var(--text)', borderRadius: '4px',
+          }}
+          onMouseEnter={e => (e.currentTarget.style.background = 'rgba(255,255,255,0.08)')}
+          onMouseLeave={e => (e.currentTarget.style.background = 'none')}>
+            🎯 Explain GT analysis
+          </button>
+          <div style={{ height: '1px', background: 'rgba(255,255,255,0.08)', margin: '3px 0' }} />
+          <div style={{ padding: '5px 12px 4px', fontSize: '9px', color: 'var(--text3)' }}>
+            max pain · PCR · OI walls · oracle · micro CD+CUSUM
+          </div>
+        </div>
+      )}
+
+      {/* Explanation modal */}
+      {showModal && (
+        <N50GTExplanationModal gt={gt} n50={n50} onClose={() => setShowModal(false)} />
+      )}
+    </>
+  )
+}
+
+// ── N50 Elliott Wave Panel ─────────────────────────────────────────────────────
+
+const EW_TF_LABELS_N50 = ['15m', '1h', '4h', '1d', '1w', '1M'] as const
+type EWTimeframeN50 = typeof EW_TF_LABELS_N50[number]
+
+const N50_BIAS_COLOR: Record<string, string> = {
+  STRONG_BULL: 'var(--bull)',
+  BULL: 'var(--bull)',
+  NEUTRAL: 'var(--text3)',
+  BEAR: 'var(--bear)',
+  STRONG_BEAR: 'var(--bear)',
+}
+
+const N50_WAVE_COLORS: Record<string, string> = {
+  '0': 'var(--text3)', '1': '#4ade80', '2': '#facc15', '3': '#00ff9f',
+  '4': '#f97316', '5': '#60a5fa', 'A': '#f87171', 'B': '#a78bfa', 'C': '#f472b6', '?': 'var(--text3)',
+}
+
+const N50_PATTERN_LABEL: Record<string, string> = {
+  IMPULSE_BULL: 'Bull Impulse (1-2-3-4-5)',
+  IMPULSE_BEAR: 'Bear Impulse (1-2-3-4-5)',
+  CORRECTIVE_BULL: 'Bullish Correction (A-B-C)',
+  CORRECTIVE_BEAR: 'Bearish Correction (A-B-C)',
+  UNKNOWN: 'Unknown Pattern',
+}
+
+function N50EWContextMenu({ ctxMenu, selectedTF, availableTFs, onExplain, onSelectTF }: {
+  ctxMenu: { x: number; y: number }
+  selectedTF: string
+  availableTFs: string[]
+  onExplain: (() => void) | null
+  onSelectTF: (tf: EWTimeframeN50) => void
+}) {
+  const btnStyle = (active: boolean, disabled: boolean): React.CSSProperties => ({
+    display: 'block', width: '100%', textAlign: 'left',
+    background: active ? `${CYB.glow}22` : 'none',
+    border: 'none', cursor: disabled ? 'default' : 'pointer',
+    padding: '5px 12px', fontSize: '11px',
+    color: disabled ? 'var(--text3)' : active ? CYB.glow : 'var(--text)',
+    borderRadius: '3px', opacity: disabled ? 0.4 : 1,
+  })
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 7999 }} onClick={e => e.stopPropagation()}>
+      <div style={{
+        position: 'fixed', left: ctxMenu.x, top: ctxMenu.y, zIndex: 8000,
+        background: 'var(--bg)', border: `1px solid ${CYB.glowBorder}`,
+        borderRadius: '6px', padding: '4px', minWidth: '170px', boxShadow: '0 4px 20px rgba(0,0,0,0.6)',
+      }}>
+        {onExplain && (
+          <>
+            <button style={btnStyle(false, false)} onClick={onExplain}
+              onMouseEnter={e => (e.currentTarget.style.background = 'rgba(255,255,255,0.08)')}
+              onMouseLeave={e => (e.currentTarget.style.background = 'none')}>
+              📖 Explain Elliott Wave
+            </button>
+            <div style={{ height: '1px', background: 'rgba(255,255,255,0.08)', margin: '3px 0' }} />
+          </>
+        )}
+        <div style={{ padding: '3px 12px 4px', fontSize: '9px', color: 'var(--text3)', letterSpacing: '0.1em', fontWeight: 700 }}>TIMEFRAME</div>
+        {EW_TF_LABELS_N50.map(tf => {
+          const hasData = availableTFs.includes(tf)
+          const isActive = tf === selectedTF
+          return (
+            <button key={tf} style={btnStyle(isActive, !hasData)} onClick={() => hasData && onSelectTF(tf)}
+              onMouseEnter={e => { if (hasData && !isActive) e.currentTarget.style.background = 'rgba(255,255,255,0.08)' }}
+              onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = 'none' }}>
+              {isActive ? '◉' : hasData ? '○' : '·'} {tf}
+              {!hasData && <span style={{ fontSize: '9px', opacity: 0.5, marginLeft: '6px' }}>loading…</span>}
+            </button>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function N50EWExplanationModal({ ew, spot, composite, onClose }: {
+  ew: EWState; spot: number; composite: N50Composite; onClose: () => void
+}) {
+  const biasColor = N50_BIAS_COLOR[ew.combinedBias]
+  const waveColor = N50_WAVE_COLORS[ew.currentWave] ?? 'var(--text)'
+
+  const ewBullish = ew.combinedBias === 'STRONG_BULL' || ew.combinedBias === 'BULL'
+  const ewBearish = ew.combinedBias === 'STRONG_BEAR' || ew.combinedBias === 'BEAR'
+  const oracleBullish = composite.direction === 'BULL'
+  const oracleBearish = composite.direction === 'BEAR'
+  const aligned = (ewBullish && oracleBullish) || (ewBearish && oracleBearish)
+  const diverged = (ewBullish && oracleBearish) || (ewBearish && oracleBullish)
+  const alignColor = aligned ? 'var(--bull)' : diverged ? 'var(--bear)' : 'var(--text3)'
+  const alignLabel = aligned ? '✓ ALIGNED' : diverged ? '⚠ DIVERGING' : '~ NEUTRAL'
+
+  const nearestLevel = ew.levels.reduce<EWLevelC | null>((best, lv) => {
+    if (!best) return lv
+    return Math.abs(lv.price - spot) < Math.abs(best.price - spot) ? lv : best
+  }, null)
+  const distPct = nearestLevel ? ((spot - nearestLevel.price) / nearestLevel.price * 100) : null
+
+  const S: Record<string, React.CSSProperties> = {
+    overlay: { position: 'fixed', inset: 0, zIndex: 9000, background: 'rgba(0,0,0,0.82)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '12px' },
+    modal: { background: 'var(--bg)', border: `1px solid ${CYB.glowBorder}`, borderRadius: '10px', maxWidth: '560px', width: '100%', maxHeight: '88vh', overflowY: 'auto', padding: '18px 20px', display: 'flex', flexDirection: 'column', gap: '14px' },
+    sectionTitle: { fontSize: '9px', fontWeight: 700, color: CYB.glow, letterSpacing: '0.12em', marginBottom: '4px' },
+    section: { display: 'flex', flexDirection: 'column', gap: '4px', paddingBottom: '12px', borderBottom: '1px solid rgba(255,255,255,0.05)' },
+    body: { fontSize: '11px', color: 'var(--text2)', lineHeight: 1.55 },
+    chip: { display: 'inline-block', fontSize: '9px', padding: '2px 6px', borderRadius: '3px', fontWeight: 700, marginRight: '4px' },
+    closeBtn: { background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '5px', color: 'var(--text2)', cursor: 'pointer', fontSize: '11px', padding: '3px 10px', flexShrink: 0 },
+    levelRow: { display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 0', fontSize: '11px' },
+    pivotRow: { display: 'flex', gap: '4px', flexWrap: 'wrap', alignItems: 'center' },
+  }
+
+  return (
+    <div style={S.overlay} onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div style={S.modal}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '8px' }}>
+          <div>
+            <div style={{ fontSize: '8px', fontWeight: 700, color: CYB.glow, letterSpacing: '0.15em', marginBottom: '4px' }}>{'//ELLIOTT_WAVE  ·  NIFTY 50  ·  EXPLANATION'}</div>
+            <div style={{ fontSize: '14px', fontWeight: 800, color: 'var(--text)' }}>{N50_PATTERN_LABEL[ew.pattern]}</div>
+            <div style={{ fontSize: '10px', color: 'var(--text3)', marginTop: '2px' }}>conf:{Math.round(ew.confidence * 100)}%  ·  {ew.pivots.length} pivots  ·  spot ₹{spot.toFixed(0)}</div>
+          </div>
+          <button style={S.closeBtn} onClick={onClose}>✕ close</button>
+        </div>
+
+        {/* Pattern */}
+        <div style={S.section}>
+          <div style={S.sectionTitle}>PATTERN</div>
+          <div style={{ ...S.body }}>{N50_PATTERN_LABEL[ew.pattern]} — Wave {ew.currentWave} in progress. Confidence: {Math.round(ew.confidence * 100)}%</div>
+          <div style={{ marginTop: '4px', fontSize: '10px', color: biasColor, fontWeight: 700 }}>{ew.combinedBias.replace('_', ' ')}</div>
+          <div style={{ fontSize: '10px', color: 'var(--text2)', marginTop: '2px' }}>{ew.combinedNote}</div>
+        </div>
+
+        {/* Pivot sequence */}
+        {ew.pivots.length >= 2 && (
+          <div style={S.section}>
+            <div style={S.sectionTitle}>PIVOT SEQUENCE ({ew.pivots.length} pivots)</div>
+            <div style={S.pivotRow}>
+              {ew.pivots.map((pv, i) => {
+                const col = N50_WAVE_COLORS[pv.wave] ?? 'var(--text3)'
+                const isLast = i === ew.pivots.length - 1
+                return (
+                  <span key={pv.ts} style={{
+                    ...S.chip,
+                    background: `${col}22`, border: `1px solid ${col}55`,
+                    color: isLast ? col : 'var(--text2)', fontWeight: isLast ? 800 : 600,
+                  }}>
+                    {pv.wave !== '?' && pv.wave !== '0' ? pv.wave : '?'} {pv.type === 'H' ? '▲' : '▼'} ₹{pv.price.toFixed(0)} <span style={{ opacity: 0.6 }}>{pv.timeStr}</span>
+                  </span>
+                )
+              })}
+              <span style={{ ...S.chip, background: `${CYB.glow}22`, border: `1px dashed ${CYB.glow}`, color: CYB.glow }}>
+                NOW ₹{spot.toFixed(0)}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* Fibonacci levels */}
+        {(ew.invalidation != null || ew.primaryTarget != null || ew.levels.length > 0) && (
+          <div style={S.section}>
+            <div style={S.sectionTitle}>FIBONACCI KEY LEVELS</div>
+            {ew.invalidation != null && (
+              <div style={S.levelRow}>
+                <span style={{ ...S.chip, background: 'rgba(255,80,80,0.15)', border: '1px solid rgba(255,80,80,0.35)', color: 'var(--bear)' }}>INV</span>
+                <span style={{ color: 'var(--bear)', fontWeight: 700 }}>₹{ew.invalidation.toFixed(0)}</span>
+                <span style={{ color: 'var(--text3)', fontSize: '10px' }}>— wave count invalidated if price closes beyond this</span>
+              </div>
+            )}
+            {ew.primaryTarget != null && (
+              <div style={S.levelRow}>
+                <span style={{ ...S.chip, background: `${biasColor}22`, border: `1px solid ${biasColor}44`, color: biasColor }}>TGT</span>
+                <span style={{ color: biasColor, fontWeight: 700 }}>₹{ew.primaryTarget.toFixed(0)}</span>
+                <span style={{ color: 'var(--text3)', fontSize: '10px' }}>— primary Elliott wave completion target</span>
+              </div>
+            )}
+            {ew.levels.map((lv, i) => {
+              const near = Math.abs(lv.price - spot) / spot < 0.005
+              const rc = lv.role === 'support' ? 'var(--bull)' : lv.role === 'target' ? 'var(--bull)' : 'var(--bear)'
+              return (
+                <div key={i} style={{ ...S.levelRow, opacity: near ? 1 : 0.7 }}>
+                  <span style={{ ...S.chip, background: `${rc}15`, border: `1px solid ${rc}33`, color: rc }}>{lv.label}</span>
+                  <span style={{ color: near ? rc : 'var(--text)', fontWeight: near ? 700 : 400 }}>₹{lv.price.toFixed(0)}</span>
+                  {near && <span style={{ fontSize: '9px', color: CYB.glow }}>← near spot</span>}
+                </div>
+              )
+            })}
+            {nearestLevel && distPct != null && (
+              <div style={{ marginTop: '6px', fontSize: '10px', color: 'var(--text3)' }}>
+                Nearest level: <span style={{ color: 'var(--text)' }}>{nearestLevel.label} ₹{nearestLevel.price.toFixed(0)}</span>
+                {' '}— spot is <span style={{ color: Math.abs(distPct) < 0.3 ? CYB.glow : 'var(--text2)', fontWeight: 700 }}>{distPct > 0 ? '+' : ''}{distPct.toFixed(2)}%</span> away
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Oracle alignment */}
+        <div style={{ ...S.section, borderBottom: 'none', paddingBottom: 0 }}>
+          <div style={S.sectionTitle}>ORACLE vs ELLIOTT WAVE</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', marginBottom: '6px' }}>
+            <span style={{ fontSize: '13px', fontWeight: 900, color: alignColor }}>{alignLabel}</span>
+            <span style={{ fontSize: '10px', color: 'var(--text3)' }}>
+              EW: <span style={{ color: biasColor, fontWeight: 700 }}>{ew.combinedBias.replace('_', ' ')}</span>
+              {'  ·  '}Oracle: <span style={{ color: composite.direction === 'BULL' ? 'var(--bull)' : composite.direction === 'BEAR' ? 'var(--bear)' : 'var(--text3)', fontWeight: 700 }}>
+                {composite.direction === 'BULL' ? '▲' : composite.direction === 'BEAR' ? '▼' : '~'} {(composite.bullProb * 100).toFixed(0)}%B / {(composite.bearProb * 100).toFixed(0)}%Be
+              </span>
+            </span>
+          </div>
+          <div style={S.body}>
+            {aligned
+              ? `Both Elliott Wave and Oracle agree: ${ewBullish ? 'BULLISH' : 'BEARISH'} bias. When wave structure and pattern probability align, setup has higher structural conviction.`
+              : diverged
+              ? `Elliott Wave says ${ewBullish ? 'BULLISH' : 'BEARISH'} but Oracle says ${oracleBullish ? 'BULLISH' : 'BEARISH'}. Divergence means a wave transition may be near, or the pattern memory detects a regime change. Exercise caution.`
+              : 'No strong directional read from either system. Market likely in a corrective or ranging phase.'}
+          </div>
+          <div style={{ marginTop: '8px', fontSize: '9px', color: 'var(--text3)', lineHeight: 1.5 }}>
+            Elliott Wave is a structural pivot framework applied to NIFTY 50 index (token 256265) historical candles. The Oracle is the N50 composite pattern-memory system. They are independent — agreement raises confidence, divergence is a warning.
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function N50EWPanel({ n50 }: { n50: N50State }) {
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null)
+  const [showModal, setShowModal] = useState(false)
+  const [selectedTF, setSelectedTF] = useState<EWTimeframeN50>('15m')
+
+  const activeEW: EWState | null | undefined =
+    selectedTF === '15m' ? n50.elliottWave : (n50.elliottWaveByTF?.[selectedTF] ?? null)
+
+  useEffect(() => {
+    const close = () => setCtxMenu(null)
+    window.addEventListener('click', close)
+    return () => window.removeEventListener('click', close)
+  }, [])
+
+  useEffect(() => {
+    if (!showModal) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setShowModal(false) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [showModal])
+
+  const handleContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault()
+    setCtxMenu({ x: e.clientX, y: e.clientY })
+  }
+
+  const availableTFs = EW_TF_LABELS_N50.filter(tf =>
+    tf === '15m'
+      ? !!(n50.elliottWave && n50.elliottWave.pattern !== 'UNKNOWN')
+      : !!(n50.elliottWaveByTF?.[tf] && n50.elliottWaveByTF[tf]!.pattern !== 'UNKNOWN')
+  )
+
+  const spot = n50.niftySpot ?? 0
+
+  if (!activeEW || activeEW.pattern === 'UNKNOWN') {
+    return (
+      <>
+        <div onContextMenu={handleContextMenu} style={{ padding: '8px 10px', background: CYB.panel, borderRadius: '6px', border: `1px solid ${CYB.glowBorder}`, cursor: 'context-menu' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ fontSize: '8px', fontWeight: 700, color: CYB.glow, letterSpacing: '0.15em' }}>{'//ELLIOTT_WAVE  ·  NIFTY 50'}</span>
+            <span style={{ fontSize: '9px', color: 'var(--text3)' }}>
+              {selectedTF === '15m' ? 'accumulating 15-min candle history…' : `loading ${selectedTF} data…`}
+            </span>
+            <span style={{ flex: 1 }} />
+            <div style={{ display: 'flex', gap: '2px' }}>
+              {EW_TF_LABELS_N50.map(tf => {
+                const hasData = tf === '15m' ? !!(n50.elliottWave && n50.elliottWave.pattern !== 'UNKNOWN') : !!(n50.elliottWaveByTF?.[tf] && n50.elliottWaveByTF[tf]!.pattern !== 'UNKNOWN')
+                return (
+                  <button key={tf} onClick={() => setSelectedTF(tf)} style={{
+                    background: selectedTF === tf ? `${CYB.glow}33` : 'transparent',
+                    border: `1px solid ${selectedTF === tf ? CYB.glow : 'rgba(255,255,255,0.12)'}`,
+                    color: selectedTF === tf ? CYB.glow : hasData ? 'var(--text2)' : 'var(--text3)',
+                    borderRadius: '3px', padding: '1px 5px', fontSize: '8px', cursor: 'pointer', fontWeight: selectedTF === tf ? 700 : 400,
+                    opacity: hasData ? 1 : 0.4,
+                  }}>{tf}</button>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+        {ctxMenu && (
+          <N50EWContextMenu ctxMenu={ctxMenu} selectedTF={selectedTF} availableTFs={availableTFs}
+            onExplain={activeEW && activeEW.pattern !== 'UNKNOWN' ? () => { setShowModal(true); setCtxMenu(null) } : null}
+            onSelectTF={(tf) => { setSelectedTF(tf); setCtxMenu(null) }} />
+        )}
+      </>
+    )
+  }
+
+  const biasColor = N50_BIAS_COLOR[activeEW.combinedBias]
+  const isStrong = activeEW.combinedBias === 'STRONG_BULL' || activeEW.combinedBias === 'STRONG_BEAR'
+  const waveColor = N50_WAVE_COLORS[activeEW.currentWave] ?? 'var(--text)'
+
+  const pivots = activeEW.pivots
+  const minP = Math.min(...pivots.map(p => p.price))
+  const maxP = Math.max(...pivots.map(p => p.price))
+  const range = maxP - minP || 1
+
+  return (
+    <>
+      <div onContextMenu={handleContextMenu} style={{ padding: '8px 10px', background: CYB.panel, borderRadius: '6px', border: `1px solid ${CYB.glowBorder}`, display: 'flex', flexDirection: 'column', gap: '6px', cursor: 'context-menu' }}>
+        {/* Header */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: '8px', fontWeight: 700, color: CYB.glow, letterSpacing: '0.15em' }}>{'//ELLIOTT_WAVE  ·  NIFTY 50'}</span>
+          <span style={{ fontSize: '10px', color: 'var(--text2)', fontWeight: 600 }}>{N50_PATTERN_LABEL[activeEW.pattern]}</span>
+          <span style={{ fontSize: '9px', color: 'var(--text3)' }}>conf:{Math.round(activeEW.confidence * 100)}%</span>
+          <span style={{ flex: 1 }} />
+          <span style={{ fontSize: '9px', color: 'var(--text3)' }}>{selectedTF} pivots:{activeEW.pivots.length}</span>
+          <div style={{ display: 'flex', gap: '2px' }}>
+            {EW_TF_LABELS_N50.map(tf => {
+              const hasData = tf === '15m' ? !!(n50.elliottWave && n50.elliottWave.pattern !== 'UNKNOWN') : !!(n50.elliottWaveByTF?.[tf] && n50.elliottWaveByTF[tf]!.pattern !== 'UNKNOWN')
+              return (
+                <button key={tf} onClick={e => { e.stopPropagation(); setSelectedTF(tf) }} style={{
+                  background: selectedTF === tf ? `${CYB.glow}33` : 'transparent',
+                  border: `1px solid ${selectedTF === tf ? CYB.glow : 'rgba(255,255,255,0.12)'}`,
+                  color: selectedTF === tf ? CYB.glow : hasData ? 'var(--text2)' : 'var(--text3)',
+                  borderRadius: '3px', padding: '1px 5px', fontSize: '8px', cursor: 'pointer', fontWeight: selectedTF === tf ? 700 : 400,
+                  opacity: hasData ? 1 : 0.4,
+                }}>{tf}</button>
+              )
+            })}
+          </div>
+        </div>
+
+        {/* Current wave badge + combined bias */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: '4px' }}>
+            <span style={{ fontSize: '9px', color: 'var(--text3)' }}>WAVE</span>
+            <span style={{ fontSize: '20px', fontWeight: 900, color: waveColor, lineHeight: 1 }}>{activeEW.currentWave}</span>
+          </div>
+          <div style={{ width: '1px', height: '24px', background: 'rgba(255,255,255,0.1)' }} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', flex: 1, minWidth: 0 }}>
+            <span style={{ fontSize: '10px', fontWeight: 700, color: biasColor }}>
+              {isStrong ? '⚡ ' : ''}{activeEW.combinedBias.replace('_', ' ')}
+            </span>
+            <span style={{ fontSize: '9px', color: 'var(--text2)', lineHeight: 1.3 }}>{activeEW.combinedNote}</span>
+          </div>
+        </div>
+
+        {/* Pivot mini-chart */}
+        {pivots.length >= 3 && (
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: '2px', overflowX: 'auto' }}>
+            {pivots.map((pv, i) => {
+              const heightPct = (pv.price - minP) / range
+              const barH = Math.max(12, Math.round(heightPct * 40) + 12)
+              const isH = pv.type === 'H'
+              const col = N50_WAVE_COLORS[pv.wave] ?? 'var(--text3)'
+              const isCurrent = i === pivots.length - 1
+              return (
+                <div key={pv.ts} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1px', minWidth: '28px' }}>
+                  <span style={{ fontSize: '9px', fontWeight: 700, color: col, opacity: isCurrent ? 1 : 0.75 }}>
+                    {pv.wave !== '?' && pv.wave !== '0' ? pv.wave : ''}
+                  </span>
+                  <div style={{
+                    width: '20px', height: `${barH}px`,
+                    background: isH ? `linear-gradient(180deg, ${col}99, ${col}44)` : `linear-gradient(0deg, ${col}99, ${col}44)`,
+                    border: isCurrent ? `1px solid ${col}` : '1px solid rgba(255,255,255,0.1)',
+                    borderRadius: '2px', position: 'relative',
+                  }}>
+                    <span style={{ position: 'absolute', top: isH ? '-1px' : 'auto', bottom: isH ? 'auto' : '-1px', left: '50%', transform: 'translateX(-50%)', fontSize: '7px', color: col }}>
+                      {isH ? '▲' : '▼'}
+                    </span>
+                  </div>
+                  <span style={{ fontSize: '7px', color: 'var(--text3)', whiteSpace: 'nowrap' }}>
+                    {pv.price >= 1000 ? pv.price.toFixed(0) : pv.price.toFixed(1)}
+                  </span>
+                  <span style={{ fontSize: '7px', color: 'var(--text3)', opacity: 0.7 }}>{pv.timeStr}</span>
+                </div>
+              )
+            })}
+            {/* Current spot marker */}
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1px', minWidth: '28px' }}>
+              <span style={{ fontSize: '9px', color: CYB.glow }}>NOW</span>
+              <div style={{ width: '20px', height: `${Math.max(12, Math.round(((spot - minP) / range) * 40) + 12)}px`, border: `1px dashed ${CYB.glow}`, borderRadius: '2px', background: `${CYB.glow}22` }} />
+              <span style={{ fontSize: '7px', color: CYB.glow }}>{spot.toFixed(0)}</span>
+            </div>
+          </div>
+        )}
+
+        {/* Key levels */}
+        {activeEW.levels.length > 0 && (
+          <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+            {activeEW.primaryTarget != null && (
+              <span style={{ fontSize: '9px', padding: '1px 5px', background: `${biasColor}22`, border: `1px solid ${biasColor}44`, borderRadius: '3px', color: biasColor, fontWeight: 700 }}>
+                TGT ₹{activeEW.primaryTarget.toFixed(0)}
+              </span>
+            )}
+            {activeEW.invalidation != null && (
+              <span style={{ fontSize: '9px', padding: '1px 5px', background: 'rgba(255,100,100,0.1)', border: '1px solid rgba(255,100,100,0.3)', borderRadius: '3px', color: 'var(--bear)', fontWeight: 700 }}>
+                INV ₹{activeEW.invalidation.toFixed(0)}
+              </span>
+            )}
+            {activeEW.levels.slice(0, 4).map((lv, i) => {
+              const isNearSpot = spot > 0 && Math.abs(lv.price - spot) / spot < 0.005
+              const roleColor = lv.role === 'target' ? 'var(--bull)' : lv.role === 'support' ? 'var(--bull)' : 'var(--bear)'
+              return (
+                <span key={i} style={{ fontSize: '9px', padding: '1px 5px', background: isNearSpot ? `${roleColor}22` : 'transparent', border: `1px solid ${roleColor}44`, borderRadius: '3px', color: isNearSpot ? roleColor : 'var(--text3)' }}>
+                  {lv.label} ₹{lv.price.toFixed(0)}
+                </span>
+              )
+            })}
+          </div>
+        )}
+
+        {/* Oracle context */}
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center', borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '4px', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: '8px', color: 'var(--text3)' }}>ORACLE</span>
+          <span style={{ fontSize: '10px', fontWeight: 700, color: n50.composite.direction === 'BULL' ? 'var(--bull)' : n50.composite.direction === 'BEAR' ? 'var(--bear)' : 'var(--text3)' }}>
+            {n50.composite.direction === 'BULL' ? '▲' : n50.composite.direction === 'BEAR' ? '▼' : '~'} {(n50.composite.bullProb * 100).toFixed(0)}%B / {(n50.composite.bearProb * 100).toFixed(0)}%Be
+          </span>
+          <span style={{ fontSize: '9px', color: 'var(--text3)' }}>conf:{Math.round(n50.composite.confidence * 100)}%</span>
+          <span style={{ fontSize: '9px', color: 'var(--text3)' }}>pred:{n50.composite.predictedMove >= 0 ? '+' : ''}{n50.composite.predictedMove.toFixed(3)}%</span>
+        </div>
+      </div>
+
+      {/* Context menu */}
+      {ctxMenu && (
+        <N50EWContextMenu ctxMenu={ctxMenu} selectedTF={selectedTF} availableTFs={availableTFs}
+          onExplain={() => { setShowModal(true); setCtxMenu(null) }}
+          onSelectTF={tf => { setSelectedTF(tf); setCtxMenu(null) }} />
+      )}
+
+      {/* Explanation modal */}
+      {showModal && activeEW && (
+        <N50EWExplanationModal ew={activeEW} spot={spot} composite={n50.composite} onClose={() => setShowModal(false)} />
+      )}
+    </>
+  )
+}
+
 // ── N50 SysLog ──────────────────────────────────────────────────────────
 
 function N50SysLog({ entries, at, onArm, onDisarm, restricted = false }: { entries: SysLogEntry[]; at: ATState; onArm: () => void; onDisarm: () => void; restricted?: boolean }) {
@@ -836,7 +1946,7 @@ function N50SysLog({ entries, at, onArm, onDisarm, restricted = false }: { entri
 
 // ── N50 Oracle (composite + pattern + technicals + day + breadth) ────────
 
-function N50Oracle({ n50 }: { n50: N50State | null }) {
+function N50Oracle({ n50, role = 'admin' }: { n50: N50State | null; role?: string }) {
   const [showComponents, setShowComponents] = useState(false)
   if (!n50) return (
     <div style={{ padding: '12px', background: CYB.panel, border: `1px solid ${CYB.glowBorder}`, borderRadius: '6px' }}>
@@ -861,6 +1971,8 @@ function N50Oracle({ n50 }: { n50: N50State | null }) {
   const compBear = Math.round(comp.bearProb * 100)
   const compDir = comp.predictedMove >= 0 ? 'BULL' as const : 'BEAR' as const
   const compColor = compDir === 'BULL' ? 'var(--bull)' : 'var(--bear)'
+
+  const kb = role !== 'viewer' ? computeKalmanBias(n50.sysLog ?? [], comp.predictedMove) : null
 
   const techBullPct = Math.round(comp.components.techBullScore * 100)
   const techBearPct = 100 - techBullPct
@@ -927,6 +2039,24 @@ function N50Oracle({ n50 }: { n50: N50State | null }) {
         </div>
       )}
 
+      {/* Kalman bias panel — admin only */}
+      {kb && (
+        <div style={{ marginTop: '0px', padding: '6px 8px', borderRadius: '4px', background: 'rgba(0,0,0,0.15)', border: `1px solid ${CYB.glowBorder}`, fontSize: '9px', display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' }}>
+          <span style={{ color: CYB.glow, letterSpacing: '0.1em', fontWeight: 700 }}>{'//KALMAN'}</span>
+          <span style={{ color: 'var(--text2)' }}>adj <span style={{ color: kb.correctedMove > 0 ? 'var(--bull)' : kb.correctedMove < 0 ? 'var(--bear)' : 'var(--text3)', fontWeight: 700 }}>{kb.correctedMove >= 0 ? '+' : ''}{kb.correctedMove.toFixed(3)}%</span></span>
+          <span style={{ color: kb.bias > 0.01 ? 'var(--bull)' : kb.bias < -0.01 ? 'var(--bear)' : 'var(--text3)' }}>bias {kb.bias >= 0 ? '+' : ''}{kb.bias.toFixed(3)}% {Math.abs(kb.bias) > 0.01 ? (kb.bias > 0 ? '·cold' : '·hot') : '·'}</span>
+          <span style={{ color: 'var(--text3)' }}>σ=±{kb.sigma.toFixed(3)}%</span>
+          <span style={{ color: 'var(--text3)' }}>rmse={kb.rmse.toFixed(3)}%</span>
+          <span style={{ color: 'var(--text3)' }}>hit±0.3%: {Math.round(kb.hitRate * 100)}%</span>
+          <span style={{ color: 'var(--text3)' }}>n={kb.nResolved}</span>
+        </div>
+      )}
+      {!kb && role !== 'viewer' && comp.status === 'ready' && (
+        <div style={{ fontSize: '9px', color: 'var(--text3)' }}>
+          {'//KALMAN'} calibrating — {(n50.sysLog ?? []).filter(e => e.resolved).length}/5 resolved
+        </div>
+      )}
+
       {/* Component breakdown: Pattern KNN + Pat60_20 + Technicals */}
       <div style={{
         display: 'flex', flexDirection: 'column', gap: '3px',
@@ -948,7 +2078,7 @@ function N50Oracle({ n50 }: { n50: N50State | null }) {
           label="PAT·N50"
           bullPct={patBull} bearPct={patBear}
           move={pred.status === 'ready' ? pred.predictedMove : undefined}
-          detail={pred.status === 'ready' ? `sim ${pred.topSim.toFixed(2)} · n=${pred.nResolved}` : pred.status}
+          detail={pred.status === 'ready' ? (role !== 'viewer' ? `sim ${pred.topSim.toFixed(2)} · n=${pred.nResolved}` : '') : pred.status}
           dim={pred.status !== 'ready'}
         />
 
@@ -1290,21 +2420,11 @@ function N50ContractsCompact({ n50, orderState, setOrderState }: {
 
 // ── N50 Command Center (grid container) ──────────────────────────────────
 
-function N50CommandCenter({ n50, orderState, setOrderState }: {
+function N50CommandCenter({ n50, role = 'admin' }: {
   n50: N50State | null
-  orderState: OrderState
-  setOrderState: (fn: (prev: OrderState) => OrderState) => void
+  role?: string
 }) {
-  return (
-    <div style={{
-      display: 'grid',
-      gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))',
-      gap: '8px',
-    }}>
-      <N50Oracle n50={n50} />
-      <N50ContractsCompact n50={n50} orderState={orderState} setOrderState={setOrderState} />
-    </div>
-  )
+  return <N50Oracle n50={n50} role={role} />
 }
 
 // ── Option Metrics (Delta, Theta, Sensitivity) ─────────────────────────
@@ -2102,13 +3222,14 @@ interface SyncedPosition {
   bestAsk: number | null
 }
 
-function PositionsHUD({ positions, capital, posConvictions, n50, onPositionsUpdate, stocks }: {
+function PositionsHUD({ positions, capital, posConvictions, n50, onPositionsUpdate, stocks, role = 'admin' }: {
   positions: Position[]
   capital: CapitalData | null
   posConvictions: { stock: StockEntry; conviction: ConvictionResult }[]
   n50?: N50State | null
   onPositionsUpdate?: (updater: (prev: Position[]) => Position[]) => void
   stocks?: StockEntry[]
+  role?: string
 }) {
   const [syncing, setSyncing] = useState(false)
   const [syncResult, setSyncResult] = useState<{ positions: SyncedPosition[]; ts: number } | null>(null)
@@ -2264,7 +3385,7 @@ function PositionsHUD({ positions, capital, posConvictions, n50, onPositionsUpda
             <PositionCard key={pos.buySymbol} pos={pos} n50={n50} stocks={stocks} />
           ))}
           {posConvictions.map(({ stock, conviction }) => (
-            <ConvictionCard key={stock.name} stock={stock} conviction={conviction} positions={positions} n50={n50} />
+            <ConvictionCard key={stock.name} stock={stock} conviction={conviction} positions={positions} n50={n50} role={role} />
           ))}
         </div>
       )}
@@ -2596,6 +3717,7 @@ export default function ConvictionClient({ role = 'admin' }: { role?: string }) 
 
   const posStocks = positions.map(p => p.stock)
   const posConvictions = convictions.filter(({ stock }) => posStocks.includes(stock.name))
+  const unmatchedPositions = positions.filter(p => !posConvictions.some(pc => pc.stock.name === p.stock))
 
   async function handleLogout() {
     await fetch('/api/auth/logout', { method: 'POST' })
@@ -2659,30 +3781,63 @@ export default function ConvictionClient({ role = 'admin' }: { role?: string }) 
         </div>
       </div>
 
-      {/* N50 Command Center — restricted for viewer */}
-      {filter === 'nifty50' && role !== 'viewer' && (
+      {/* N50 draggable panels — Oracle/GT, SysLog, Chain+EW, Contracts, Positions */}
+      {filter === 'nifty50' && (
         <div style={{ padding: '8px 10px 0' }}>
-          <N50CommandCenter n50={n50} orderState={orderState} setOrderState={setOrderState} />
-        </div>
-      )}
-
-      {/* N50 SysLog + Auto-Trader */}
-      {filter === 'nifty50' && n50 && (
-        <div style={{ padding: '8px 10px 0' }}>
-          <N50SysLog
-            entries={n50.sysLog ?? []}
-            at={at}
-            onArm={role !== 'viewer' ? () => handleATAction('ARM') : () => {}}
-            onDisarm={role !== 'viewer' ? () => handleATAction('DISARM') : () => {}}
-            restricted={role === 'viewer'}
+          <DraggablePanelLayout
+            storageKey="zd-n50-panels"
+            isAdmin={role === 'admin'}
+            gap={8}
+            panels={([
+              {
+                id: 'oracle_gt',
+                visible: true,
+                node: (
+                  <div style={{ display: 'grid', gridTemplateColumns: role === 'admin' && n50 ? 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))' : '1fr', gap: '8px' }}>
+                    <N50CommandCenter n50={n50} role={role} />
+                    {role === 'admin' && n50 && <N50GTPanel n50={n50} />}
+                  </div>
+                ),
+              },
+              {
+                id: 'sys_log',
+                visible: !!n50,
+                node: n50 ? (
+                  <N50SysLog
+                    entries={n50.sysLog ?? []}
+                    at={at}
+                    onArm={role !== 'viewer' ? () => handleATAction('ARM') : () => {}}
+                    onDisarm={role !== 'viewer' ? () => handleATAction('DISARM') : () => {}}
+                    restricted={role === 'viewer'}
+                  />
+                ) : null,
+              },
+              {
+                id: 'chain_ew',
+                visible: !!(n50?.oiAnalytics || n50?.elliottWave || n50?.elliottWaveByTF),
+                node: (n50?.oiAnalytics || n50?.elliottWave || n50?.elliottWaveByTF) ? (
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 320px), 1fr))', gap: '8px' }}>
+                    {n50?.oiAnalytics && <N50ChainPanel n50={n50} />}
+                    {(n50?.elliottWave || n50?.elliottWaveByTF) && <N50EWPanel n50={n50!} />}
+                  </div>
+                ) : null,
+              },
+              {
+                id: 'contracts',
+                visible: role !== 'viewer',
+                node: role !== 'viewer' ? (
+                  <N50ContractsCompact n50={n50} orderState={orderState} setOrderState={setOrderState} />
+                ) : null,
+              },
+            ] satisfies PanelDef[])}
           />
         </div>
       )}
 
-      {/* Positions HUD — restricted for viewer */}
+      {/* Positions HUD — shown in all filter views except 'positions' tab */}
       {filter !== 'positions' && role !== 'viewer' && (
         <div style={{ padding: '8px 10px 0' }}>
-          <PositionsHUD positions={positions} capital={capital} posConvictions={posConvictions} n50={n50} onPositionsUpdate={setPositions} stocks={stocks} />
+          <PositionsHUD positions={positions} capital={capital} posConvictions={posConvictions} n50={n50} onPositionsUpdate={setPositions} stocks={stocks} role={role} />
         </div>
       )}
       {filter !== 'positions' && role === 'viewer' && (
@@ -2715,10 +3870,13 @@ export default function ConvictionClient({ role = 'admin' }: { role?: string }) 
             {status === 'connecting' ? 'Connecting to data stream...' : 'No stocks match this filter'}
           </div>
         )}
+        {filter === 'positions' && role !== 'viewer' && unmatchedPositions.map(pos => (
+          <PositionCard key={pos.buySymbol} pos={pos} n50={n50} stocks={stocks} />
+        ))}
         {filtered
           .filter(({ stock }) => filter === 'positions' || !posStocks.includes(stock.name))
           .map(({ stock, conviction }) => (
-            <ConvictionCard key={stock.name} stock={stock} conviction={conviction} positions={positions} n50={n50} />
+            <ConvictionCard key={stock.name} stock={stock} conviction={conviction} positions={positions} n50={n50} role={role} />
           ))}
       </div>
 

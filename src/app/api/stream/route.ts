@@ -26,6 +26,7 @@ export async function GET(_req: NextRequest) {
         }
       }
 
+      const isViewer = user.role === 'viewer'
       const send = (data: unknown) => enqueue(`data: ${JSON.stringify(data)}\n\n`)
       // SSE comment — keeps proxy alive, no client-side effect
       const heartbeat = () => enqueue(': heartbeat\n\n')
@@ -33,7 +34,13 @@ export async function GET(_req: NextRequest) {
       // Send snapshot immediately on connect
       const state = readStockState()
       const makeSnapshot = (s: ReturnType<typeof readStockState>) => s
-        ? { type: 'snapshot', stocks: sortedStocks(s).map(([name, st]) => ({ name, ...st })), positions: s.positions, capital: s.capital, updatedAt: s.updatedAt }
+        ? {
+            type: 'snapshot',
+            stocks: sortedStocks(s).map(([name, st]) => ({ name, ...st })),
+            positions: isViewer ? [] : s.positions,
+            capital: isViewer ? null : s.capital,
+            updatedAt: s.updatedAt,
+          }
         : { type: 'waiting' }
 
       send(makeSnapshot(state))
@@ -43,7 +50,7 @@ export async function GET(_req: NextRequest) {
         if (closed) { clearInterval(pricesInterval); return }
         const p = readStockPrices()
         if (!p) return
-        const posData = readPositions()
+        const posData = isViewer ? null : readPositions()
         send({ type: 'prices', prices: p.prices, updatedAt: p.updatedAt, positions: posData?.positions, capital: posData?.capital })
       }, 1000)
 

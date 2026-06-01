@@ -80,6 +80,9 @@ function migrate(db: DatabaseSync) {
 
   // Add role column to users (migration for existing DBs)
   try { db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'") } catch {}
+  // Add active flag and restriction message (migration for existing DBs)
+  try { db.exec("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1") } catch {}
+  try { db.exec("ALTER TABLE users ADD COLUMN restricted_msg TEXT") } catch {}
 
   // Seed default admin user if not present
   const existing = db.prepare('SELECT id FROM users WHERE username = ?').get('zee')
@@ -94,12 +97,25 @@ function migrate(db: DatabaseSync) {
     const himaHash = bcrypt.hashSync('mastersoftheuniverse', 10)
     db.prepare('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)').run('hima', himaHash, 'viewer')
   }
+
+  // Seed nitish (trial expired — keep account, block login)
+  const existingNitish = db.prepare('SELECT id FROM users WHERE username = ?').get('nitish') as { id: number } | undefined
+  if (!existingNitish) {
+    const nitishHash = bcrypt.hashSync('26551753', 10)
+    db.prepare('INSERT INTO users (username, password_hash, role, active, restricted_msg) VALUES (?, ?, ?, ?, ?)')
+      .run('nitish', nitishHash, 'viewer', 0, 'Your 72-hour free trial has expired. Contact us to continue access.')
+  } else {
+    db.prepare("UPDATE users SET active = 0, restricted_msg = ? WHERE username = 'nitish'")
+      .run('Your 72-hour free trial has expired. Contact us to continue access.')
+  }
+  // Invalidate any active sessions for restricted users
+  db.prepare("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE active = 0)").run()
 }
 
 export function getUserByUsername(username: string) {
   return getDb()
     .prepare('SELECT * FROM users WHERE username = ?')
-    .get(username) as { id: number; username: string; password_hash: string; role: string } | undefined
+    .get(username) as { id: number; username: string; password_hash: string; role: string; active: number; restricted_msg: string | null } | undefined
 }
 
 export function createSession(userId: number): string {

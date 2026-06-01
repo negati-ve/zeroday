@@ -1,12 +1,13 @@
 'use client'
 import { useState, useEffect, useRef, useCallback } from 'react'
-import type { StockState, WallData, DepthWall } from '@/lib/stockState'
+import type { StockState, WallData, DepthWall, MetaRegimeData } from '@/lib/stockState'
 
 interface Props {
   name: string
   stock: StockState & { name: string }
   pinned?: boolean
   onPin?: () => void
+  role?: string
 }
 
 // ── Strike helpers ─────────────────────────────────────────────────────────
@@ -43,7 +44,7 @@ function fmtAge(sec: number): string {
   return m > 0 ? `${h}h${m}m` : `${h}h`
 }
 
-function PatBar({ label, data, ltp }: { label: string; data: NonNullable<StockState['pat5']> | null; ltp?: number }) {
+function PatBar({ label, data, ltp, role }: { label: string; data: NonNullable<StockState['pat5']> | null; ltp?: number; role?: string }) {
   if (!data) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', opacity: 0.35 }}>
@@ -89,10 +90,37 @@ function PatBar({ label, data, ltp }: { label: string; data: NonNullable<StockSt
         </span>
       ) : (
         <span className="zd-pat-sim" style={{ width: '80px', textAlign: 'right', fontSize: '10px', color: 'var(--text3)', flexShrink: 0 }}>
-          {data.sim.toFixed(2)} n={data.n}
+          {role !== 'viewer' ? <>{data.sim.toFixed(2)} n={data.n}</> : null}
         </span>
       )}
     </div>
+  )
+}
+
+// ── RegimeBadge ───────────────────────────────────────────────────────────
+
+const REGIME_EMOJI: Record<string, string> = {
+  ACCUMULATION: '📦', MARKUP: '🚀', DISTRIBUTION: '📤', MARKDOWN: '📉', CHOP: '〰️', UNKNOWN: '❓',
+}
+const REGIME_SHORT: Record<string, string> = {
+  ACCUMULATION: 'acc', MARKUP: 'mkp', DISTRIBUTION: 'dist', MARKDOWN: 'mkdn', CHOP: 'chop', UNKNOWN: '?',
+}
+
+function regimeColor(regime: string): string {
+  if (regime === 'ACCUMULATION' || regime === 'MARKUP') return 'var(--bull)'
+  if (regime === 'DISTRIBUTION' || regime === 'MARKDOWN') return 'var(--bear)'
+  return 'var(--text3)'
+}
+
+function RegimeBadge({ data }: { data: MetaRegimeData | null | undefined }) {
+  if (!data || data.regime === 'UNKNOWN') return null
+  const emoji = REGIME_EMOJI[data.regime] ?? '❓'
+  const short = REGIME_SHORT[data.regime] ?? data.regime.toLowerCase()
+  const conf  = Math.round(data.confidence * 100)
+  return (
+    <span style={{ color: regimeColor(data.regime), fontSize: '10px' }}>
+      {emoji}{short}·{conf}%
+    </span>
   )
 }
 
@@ -130,7 +158,7 @@ function signed(v: number | null | undefined, d = 2) {
   return `${v >= 0 ? '+' : ''}${v.toFixed(d)}`
 }
 
-function ExpandedPanel({ stock: s }: { stock: StockState }) {
+function ExpandedPanel({ stock: s, role = 'admin' }: { stock: StockState; role?: string }) {
   const rangeStr = s.intradayHigh != null && s.intradayLow != null
     ? `₹${s.intradayLow} — ₹${s.intradayHigh} (${(((s.intradayHigh - s.intradayLow) / s.intradayLow) * 100).toFixed(1)}%)`
     : null
@@ -152,6 +180,41 @@ function ExpandedPanel({ stock: s }: { stock: StockState }) {
           )}
         </div>
       </div>
+      {/* Meta regime */}
+      {(s.metaRegime || s.sessionRegime) && (
+        <div>
+          <div style={{ fontSize: '9px', color: 'var(--text3)', letterSpacing: '0.1em', marginBottom: '6px' }}>META REGIME</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+            {s.metaRegime && s.metaRegime.regime !== 'UNKNOWN' && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' }}>
+                <span style={{ fontSize: '10px', color: 'var(--text3)', width: '46px', flexShrink: 0 }}>15-min</span>
+                <span style={{ fontSize: '11px', fontWeight: 600, color: regimeColor(s.metaRegime.regime) }}>
+                  {REGIME_EMOJI[s.metaRegime.regime]} {s.metaRegime.regime}
+                </span>
+                <span style={{ fontSize: '10px', color: 'var(--text3)' }}>{Math.round(s.metaRegime.confidence * 100)}%</span>
+                <span style={{ fontSize: '10px', color: s.metaRegime.avgCdZ >= 0 ? 'var(--bull)' : 'var(--bear)' }}>cdZ:{signed(s.metaRegime.avgCdZ, 2)}</span>
+                <span style={{ fontSize: '10px', color: s.metaRegime.avgObi >= 0 ? 'var(--bull)' : 'var(--bear)' }}>obi:{signed(s.metaRegime.avgObi, 2)}</span>
+                <span style={{ fontSize: '10px', color: 'var(--text3)' }}>div:{(s.metaRegime.divergenceScore * 100).toFixed(0)}%</span>
+                <span style={{ fontSize: '10px', color: s.metaRegime.momentumSlope >= 0 ? 'var(--bull)' : 'var(--bear)' }}>
+                  mom:{s.metaRegime.momentumSlope >= 0 ? '+' : ''}{(s.metaRegime.momentumSlope * 1000).toFixed(1)}‰
+                </span>
+              </div>
+            )}
+            {s.sessionRegime && s.sessionRegime.regime !== 'UNKNOWN' && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' }}>
+                <span style={{ fontSize: '10px', color: 'var(--text3)', width: '46px', flexShrink: 0 }}>session</span>
+                <span style={{ fontSize: '11px', fontWeight: 600, color: regimeColor(s.sessionRegime.regime) }}>
+                  {REGIME_EMOJI[s.sessionRegime.regime]} {s.sessionRegime.regime}
+                </span>
+                <span style={{ fontSize: '10px', color: 'var(--text3)' }}>{Math.round(s.sessionRegime.confidence * 100)}%</span>
+                <span style={{ fontSize: '10px', color: s.sessionRegime.avgCdZ >= 0 ? 'var(--bull)' : 'var(--bear)' }}>cdZ:{signed(s.sessionRegime.avgCdZ, 2)}</span>
+                <span style={{ fontSize: '10px', color: s.sessionRegime.avgObi >= 0 ? 'var(--bull)' : 'var(--bear)' }}>obi:{signed(s.sessionRegime.avgObi, 2)}</span>
+                <span style={{ fontSize: '10px', color: 'var(--text3)' }}>div:{(s.sessionRegime.divergenceScore * 100).toFixed(0)}%</span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
       {/* Volume profile */}
       {(s.hvn || s.va || s.poc) && (
         <div>
@@ -218,7 +281,7 @@ function ExpandedPanel({ stock: s }: { stock: StockState }) {
       {s.pat30 && (
         <div>
           <div style={{ fontSize: '9px', color: 'var(--text3)', letterSpacing: '0.1em', marginBottom: '6px' }}>SESSION PATTERN (8-dim)</div>
-          <PatBar label="PAT-30m" data={s.pat30} />
+          <PatBar label="PAT-30m" data={s.pat30} role={role} />
         </div>
       )}
       {/* Technical indicators */}
@@ -376,7 +439,7 @@ function Toast({ msg, onDone }: { msg: string; onDone: () => void }) {
 
 // ── Main card ─────────────────────────────────────────────────────────────
 
-export default function StockCard({ name, stock, pinned = false, onPin }: Props) {
+export default function StockCard({ name, stock, pinned = false, onPin, role = 'admin' }: Props) {
   const [expanded,    setExpanded]    = useState(false)
   const [highlighted, setHighlighted] = useState(() => readHighlighted().has(name))
   const [ctxPos,      setCtxPos]      = useState<CtxPos | null>(null)
@@ -476,6 +539,7 @@ export default function StockCard({ name, stock, pinned = false, onPin }: Props)
           <span>OBI {stock.imbalance != null ? `${stock.imbalance >= 0 ? '+' : ''}${stock.imbalance.toFixed(2)}` : '—'}</span>
           <span>CDZ {stock.cdZ != null ? `${stock.cdZ >= 0 ? '+' : ''}${stock.cdZ.toFixed(1)}σ` : '—'}</span>
           <span>×{stock.confirmCount}</span>
+          <RegimeBadge data={stock.metaRegime} />
         </div>
 
         {/* Indicators row */}
@@ -511,9 +575,9 @@ export default function StockCard({ name, stock, pinned = false, onPin }: Props)
           </div>
         ) : (
           <>
-            <PatBar label="PAT-30→5"  data={stock.pat30_5 ?? null}  ltp={stock.ltp} />
-            <PatBar label="PAT-60→20" data={stock.pat60_20 ?? null} ltp={stock.ltp} />
-            <PatBar label="PAT-30v2"  data={stock.pat30v2 ?? null}  ltp={stock.ltp} />
+            <PatBar label="PAT-30→5"  data={stock.pat30_5 ?? null}  ltp={stock.ltp} role={role} />
+            <PatBar label="PAT-60→20" data={stock.pat60_20 ?? null} ltp={stock.ltp} role={role} />
+            <PatBar label="PAT-30v2"  data={stock.pat30v2 ?? null}  ltp={stock.ltp} role={role} />
           </>
         )}
 
@@ -521,11 +585,11 @@ export default function StockCard({ name, stock, pinned = false, onPin }: Props)
         {expanded && (
           <>
             <div style={{ borderTop: '1px solid var(--border)', paddingTop: '6px', marginTop: '2px' }}>
-              <PatBar label="PAT-5m"  data={stock.pat5}  ltp={stock.ltp} />
-              <PatBar label="PAT-15m" data={stock.pat15} ltp={stock.ltp} />
-              {stock.pat30 && !stock.pat30v2 && <PatBar label="PAT-30m" data={stock.pat30} ltp={stock.ltp} />}
+              <PatBar label="PAT-5m"  data={stock.pat5}  ltp={stock.ltp} role={role} />
+              <PatBar label="PAT-15m" data={stock.pat15} ltp={stock.ltp} role={role} />
+              {stock.pat30 && !stock.pat30v2 && <PatBar label="PAT-30m" data={stock.pat30} ltp={stock.ltp} role={role} />}
             </div>
-            <ExpandedPanel stock={stock} />
+            <ExpandedPanel stock={stock} role={role} />
           </>
         )}
       </div>
