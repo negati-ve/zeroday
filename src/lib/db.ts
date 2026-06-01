@@ -91,11 +91,15 @@ function migrate(db: DatabaseSync) {
     db.prepare('INSERT INTO users (username, password_hash) VALUES (?, ?)').run('zee', hash)
   }
 
-  // Seed viewer user if not present
-  const existingHima = db.prepare('SELECT id FROM users WHERE username = ?').get('hima')
+  // Seed hima (trial expired — keep account, block login)
+  const existingHima = db.prepare('SELECT id FROM users WHERE username = ?').get('hima') as { id: number } | undefined
   if (!existingHima) {
     const himaHash = bcrypt.hashSync('mastersoftheuniverse', 10)
-    db.prepare('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)').run('hima', himaHash, 'viewer')
+    db.prepare('INSERT INTO users (username, password_hash, role, active, restricted_msg) VALUES (?, ?, ?, ?, ?)')
+      .run('hima', himaHash, 'viewer', 0, 'Your 72-hour free trial has expired. Contact us to continue access.')
+  } else {
+    db.prepare("UPDATE users SET active = 0, restricted_msg = ? WHERE username = 'hima'")
+      .run('Your 72-hour free trial has expired. Contact us to continue access.')
   }
 
   // Seed nitish (trial expired — keep account, block login)
