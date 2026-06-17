@@ -91,6 +91,11 @@ interface Store {
   lastEWTs: number
   ewPivotsByTF: Partial<Record<string, EWPivot[]>>
   lastEWTsByTF: Partial<Record<string, number>>
+  // Phase analysis rolling histories (reset each session, not persisted)
+  // Phase analysis rolling histories (reset each session, not persisted)
+  cdZHistory: number[]
+  obiCdPairs: { obi: number; cdZ: number }[]
+  knnHistory: { direction: 'BULL' | 'BEAR' | null; bullProb: number }[]
 }
 
 export interface N50Prediction {
@@ -143,6 +148,19 @@ export interface N50Composite {
   }
 }
 
+export interface N50PhaseAnalysis {
+  phase: 'START' | 'MID' | 'END' | 'UNKNOWN'
+  confidence: number
+  stabilityLabel: 'STABLE' | 'TRANSITIONING' | 'NOISY'
+  featureMaxStd: number
+  cdVelRoC: number
+  cdVelRoCLabel: 'ACCELERATING' | 'STEADY' | 'DECELERATING'
+  obiCdCorr: number
+  obiCdPhase: 'HIDDEN' | 'VISIBLE' | 'NEUTRAL'
+  knnConsistency: 'ALIGNED' | 'MIXED' | 'INSUFFICIENT'
+  knnConsistencyDetail: string
+}
+
 export interface N50State {
   prediction: N50Prediction
   technicals: N50Technicals
@@ -163,6 +181,7 @@ export interface N50State {
   lowweights?: HeavyweightDetail[]
   elliottWave?: ElliottWaveState | null
   elliottWaveByTF?: Partial<Record<string, ElliottWaveState>>
+  phaseAnalysis?: N50PhaseAnalysis
 }
 
 // ── Elliott Wave Types ────────────────────────────────────────────────────────
@@ -547,6 +566,9 @@ let store: Store = {
   lastEWTs: 0,
   ewPivotsByTF: {},
   lastEWTsByTF: {},
+  cdZHistory: [],
+  obiCdPairs: [],
+  knnHistory: [],
 }
 
 let loaded = false
@@ -970,6 +992,9 @@ function resetSession(ts: number, stocks: Record<string, StockState>) {
   store.sessionDay = getISTDay(ts)
   store.sessionPrices = {}
   store.snapshots = []
+  store.cdZHistory = []
+  store.obiCdPairs = []
+  store.knnHistory = []
   for (const name of NIFTY50_STOCKS) {
     const s = stocks[name]
     if (s && s.ltp > 0) store.sessionPrices[name] = s.ltp
@@ -1227,6 +1252,108 @@ function getDayPredictionState(): DayPredictionState {
   }
 }
 
+// ── Phase Analysis Helpers ─────────────────────────────────────────────────
+
+function _n50PearsonR(xs: number[], ys: number[]): number {
+  const n = Math.min(xs.length, ys.length)
+  if (n < 3) return 0
+  const meanX = xs.slice(-n).reduce((a, b) => a + b, 0) / n
+  const meanY = ys.slice(-n).reduce((a, b) => a + b, 0) / n
+  let num = 0, dx2 = 0, dy2 = 0
+  for (let i = xs.length - n; i < xs.length; i++) {
+    const dx = xs[i] - meanX, dy = ys[i] - meanY
+    num += dx * dy; dx2 += dx * dx; dy2 += dy * dy
+  }
+  const denom = Math.sqrt(dx2 * dy2)
+  return denom < 1e-12 ? 0 : num / denom
+}
+
+function computeN50Phase(
+  snapshots: Snapshot[],
+  cdZHistory: number[],
+  obiCdPairs: { obi: number; cdZ: number }[],
+  knnHistory: { direction: 'BULL' | 'BEAR' | null; bullProb: number }[]
+): N50PhaseAnalysis {
+  // Metric 1 — feature variance stability (last 5 snapshots, per-dim std)
+  let featureMaxStd = 0
+  const recentSnaps = snapshots.slice(-5)
+  if (recentSnaps.length >= 2) {
+    const dim = recentSnaps[0].vec.length
+    for (let d = 0; d < dim; d++) {
+      const vals = recentSnaps.map(s => s.vec[d])
+      const mean = vals.reduce((a, b) => a + b, 0) / vals.length
+      const std = Math.sqrt(vals.reduce((a, v) => a + (v - mean) ** 2, 0) / vals.length)
+      if (std > featureMaxStd) featureMaxStd = std
+    }
+  }
+  const stabilityLabel: 'STABLE' | 'TRANSITIONING' | 'NOISY' =
+    featureMaxStd < 0.15 ? 'STABLE' : featureMaxStd < 0.35 ? 'TRANSITIONING' : 'NOISY'
+
+  // Metric 2 — cdVelZ rate-of-change (δcdZ = mean of last 3 vs prior 3)
+  let cdVelRoC = 0
+  if (cdZHistory.length >= 6) {
+    const recent = cdZHistory.slice(-3)
+    const prior = cdZHistory.slice(-6, -3)
+    const meanR = recent.reduce((a, b) => a + b, 0) / 3
+    const meanP = prior.reduce((a, b) => a + b, 0) / 3
+    cdVelRoC = meanR - meanP
+  }
+  const cdVelRoCLabel: 'ACCELERATING' | 'STEADY' | 'DECELERATING' =
+    cdVelRoC > 0.10 ? 'ACCELERATING' : cdVelRoC < -0.10 ? 'DECELERATING' : 'STEADY'
+
+  // Metric 3 — OBI/CD Pearson correlation
+  const obiArr = obiCdPairs.slice(-20).map(p => p.obi)
+  const cdArr  = obiCdPairs.slice(-20).map(p => p.cdZ)
+  const obiCdCorr = _n50PearsonR(obiArr, cdArr)
+  const obiCdPhase: 'HIDDEN' | 'VISIBLE' | 'NEUTRAL' =
+    obiCdCorr < -0.25 ? 'HIDDEN' : obiCdCorr > 0.25 ? 'VISIBLE' : 'NEUTRAL'
+
+  // Metric 4 — kNN consistency (last 3 queries)
+  const knn3 = knnHistory.slice(-3)
+  let knnConsistency: 'ALIGNED' | 'MIXED' | 'INSUFFICIENT' = 'INSUFFICIENT'
+  let knnConsistencyDetail = 'n/a'
+  if (knn3.length >= 2) {
+    const dirs = knn3.map(k => k.direction).filter(Boolean)
+    const bullCount = dirs.filter(d => d === 'BULL').length
+    const bearCount = dirs.filter(d => d === 'BEAR').length
+    const n = dirs.length
+    if (bullCount === n) {
+      knnConsistency = 'ALIGNED'; knnConsistencyDetail = `${n}/${n} BULL`
+    } else if (bearCount === n) {
+      knnConsistency = 'ALIGNED'; knnConsistencyDetail = `${n}/${n} BEAR`
+    } else if (n >= 2 && (bullCount >= 2 || bearCount >= 2)) {
+      knnConsistency = 'MIXED'
+      knnConsistencyDetail = `${bullCount}B/${bearCount}b of ${n}`
+    } else {
+      knnConsistency = 'MIXED'; knnConsistencyDetail = `split ${bullCount}B/${bearCount}b`
+    }
+  }
+
+  // Phase classification
+  let phase: 'START' | 'MID' | 'END' | 'UNKNOWN' = 'UNKNOWN'
+  let confidence = 0
+  if (cdZHistory.length >= 6 && obiCdPairs.length >= 10) {
+    const isHidden = obiCdPhase === 'HIDDEN'
+    const isVisible = obiCdPhase === 'VISIBLE'
+    const isAccel = cdVelRoCLabel === 'ACCELERATING'
+    const isDecel = cdVelRoCLabel === 'DECELERATING'
+    if (isHidden && isAccel) { phase = 'START'; confidence = 0.7 }
+    else if (isVisible && !isDecel) { phase = 'MID'; confidence = isAccel ? 0.8 : 0.6 }
+    else if (isDecel) { phase = 'END'; confidence = isVisible ? 0.75 : 0.55 }
+    else { phase = 'MID'; confidence = 0.4 }
+    if (stabilityLabel === 'NOISY') confidence *= 0.6
+    else if (stabilityLabel === 'TRANSITIONING') confidence *= 0.8
+  }
+
+  return {
+    phase, confidence,
+    stabilityLabel, featureMaxStd,
+    cdVelRoC, cdVelRoCLabel,
+    obiCdCorr, obiCdPhase,
+    knnConsistency, knnConsistencyDetail,
+  }
+}
+
 // ── Main Entry Point ───────────────────────────────────────────────────────
 
 export function getN50State(): N50State {
@@ -1333,6 +1460,20 @@ export function getN50State(): N50State {
   const technicals = computeTechAggregates(stocks)
   const composite = computeComposite(prediction, technicals)
 
+  // Update rolling buffers for phase analysis
+  store.cdZHistory.push(technicals.avgCdZ)
+  if (store.cdZHistory.length > 30) store.cdZHistory = store.cdZHistory.slice(-30)
+
+  store.obiCdPairs.push({ obi: technicals.avgImbalance, cdZ: technicals.avgCdZ })
+  if (store.obiCdPairs.length > 40) store.obiCdPairs = store.obiCdPairs.slice(-40)
+
+  if (prediction.direction !== null) {
+    store.knnHistory.push({ direction: prediction.direction, bullProb: prediction.bullProb })
+    if (store.knnHistory.length > 10) store.knnHistory = store.knnHistory.slice(-10)
+  }
+
+  const phaseAnalysis = computeN50Phase(store.snapshots, store.cdZHistory, store.obiCdPairs, store.knnHistory)
+
   function buildWeightDetail(names: readonly string[]): HeavyweightDetail[] {
     const out: HeavyweightDetail[] = []
     for (const name of names) {
@@ -1403,6 +1544,7 @@ export function getN50State(): N50State {
     lowweights: lowDetail,
     elliottWave,
     elliottWaveByTF,
+    phaseAnalysis,
   }
 }
 

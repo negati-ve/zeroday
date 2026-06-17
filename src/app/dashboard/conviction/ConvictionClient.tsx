@@ -174,6 +174,18 @@ interface N50State {
   }
   elliottWave?: EWState | null
   elliottWaveByTF?: Record<string, EWState>
+  phaseAnalysis?: {
+    phase: 'START' | 'MID' | 'END' | 'UNKNOWN'
+    confidence: number
+    stabilityLabel: 'STABLE' | 'TRANSITIONING' | 'NOISY'
+    featureMaxStd: number
+    cdVelRoC: number
+    cdVelRoCLabel: 'ACCELERATING' | 'STEADY' | 'DECELERATING'
+    obiCdCorr: number
+    obiCdPhase: 'HIDDEN' | 'VISIBLE' | 'NEUTRAL'
+    knnConsistency: 'ALIGNED' | 'MIXED' | 'INSUFFICIENT'
+    knnConsistencyDetail: string
+  }
 }
 
 interface ConvictionResult {
@@ -1949,7 +1961,7 @@ function N50SysLog({ entries, at, onArm, onDisarm, restricted = false }: { entri
 // ── N50 Oracle (composite + pattern + technicals + day + breadth) ────────
 
 function N50Oracle({ n50, role = 'admin' }: { n50: N50State | null; role?: string }) {
-  const [showComponents, setShowComponents] = useState(false)
+  const [showComponents, setShowComponents] = useState(true)
   if (!n50) return (
     <div style={{ padding: '12px', background: CYB.panel, border: `1px solid ${CYB.glowBorder}`, borderRadius: '6px' }}>
       <span style={{ fontSize: '10px', color: CYB.glow, opacity: 0.6 }}>{'> CONNECTING TO NEURAL NETWORK...'}</span>
@@ -2135,6 +2147,47 @@ function N50Oracle({ n50, role = 'admin' }: { n50: N50State | null; role?: strin
             color: tech.avgAggRatio > 0.1 ? 'var(--bull)' : tech.avgAggRatio < -0.1 ? 'var(--bear)' : 'var(--text2)',
           }}>{tech.avgAggRatio >= 0 ? '+' : ''}{tech.avgAggRatio.toFixed(2)}</span></span>
         </div>
+
+        {/* Phase Analysis — 4 metrics */}
+        {n50.phaseAnalysis && (() => {
+          const pa = n50.phaseAnalysis!
+          const phaseColor = pa.phase === 'START' ? '#a78bfa' : pa.phase === 'MID' ? '#34d399' : pa.phase === 'END' ? '#f87171' : 'var(--text3)'
+          const obiColor = pa.obiCdPhase === 'HIDDEN' ? '#fbbf24' : pa.obiCdPhase === 'VISIBLE' ? '#34d399' : 'var(--text3)'
+          const rocColor = pa.cdVelRoCLabel === 'ACCELERATING' ? 'var(--bull)' : pa.cdVelRoCLabel === 'DECELERATING' ? 'var(--bear)' : 'var(--text3)'
+          const knnColor = pa.knnConsistency === 'ALIGNED' ? '#34d399' : pa.knnConsistency === 'MIXED' ? '#fbbf24' : 'var(--text3)'
+          const stabColor = pa.stabilityLabel === 'STABLE' ? '#34d399' : pa.stabilityLabel === 'TRANSITIONING' ? '#fbbf24' : '#f87171'
+          return (
+            <>
+              {/* Phase header row */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', paddingLeft: '56px', marginTop: '3px', fontSize: '8px', color: 'var(--text3)' }}>
+                <span style={{ fontWeight: 700, color: CYB.glow, letterSpacing: '0.1em' }}>PHASE</span>
+                <span style={{ fontWeight: 700, color: phaseColor }}>{pa.phase}</span>
+                <span style={{ color: 'var(--text3)' }}>{(pa.confidence * 100).toFixed(0)}%</span>
+                <span style={{ color: stabColor }}>{pa.stabilityLabel}</span>
+                <span style={{ color: 'var(--text3)' }}>σ={pa.featureMaxStd.toFixed(3)}</span>
+              </div>
+              {/* 4 metric detail row */}
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', paddingLeft: '56px', fontSize: '8px', color: 'var(--text3)' }}>
+                <span>
+                  cdVelZ <span style={{ fontWeight: 600, color: rocColor }}>
+                    {pa.cdVelRoC >= 0 ? '+' : ''}{pa.cdVelRoC.toFixed(3)}
+                  </span>
+                  <span style={{ color: rocColor }}> {pa.cdVelRoCLabel.slice(0, 5)}</span>
+                </span>
+                <span>
+                  OBI·CD·r <span style={{ fontWeight: 600, color: obiColor }}>
+                    {pa.obiCdCorr >= 0 ? '+' : ''}{pa.obiCdCorr.toFixed(2)}
+                  </span>
+                  <span style={{ color: obiColor }}> {pa.obiCdPhase}</span>
+                </span>
+                <span>
+                  kNN <span style={{ fontWeight: 600, color: knnColor }}>{pa.knnConsistencyDetail}</span>
+                </span>
+              </div>
+            </>
+          )
+        })()}
+
         </>}
       </div>
 
