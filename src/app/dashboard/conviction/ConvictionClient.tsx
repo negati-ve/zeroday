@@ -921,12 +921,17 @@ interface N50GTAnalysis {
   gtDirection: 'BULL' | 'BEAR' | 'NEUTRAL'
   gtConviction: 'HIGH' | 'MEDIUM' | 'LOW'
   components: { mpC: number; pcrC: number; schC: number; orcC: number; microC: number }
+  // Per-component directional verdicts for checklist (1=agree, 0=neutral, -1=diverge)
+  checks: { mp: number; pcr: number; sch: number; orc: number; micro: number }
+  agreementCount: number  // how many of 5 signals agree with gt direction
+  divergeCount: number
   oracleTarget: number | null
   oracleTargetPct: number | null
   nashTarget: number | null
   nashTargetPct: number | null
   gtTarget: number | null
   gtTargetPct: number | null
+  setupLabel: 'PERFECT' | 'STRONG' | 'PARTIAL' | 'WEAK' | 'CONFLICTED'
 }
 
 function computeN50GT(n50: N50State): N50GTAnalysis {
@@ -1059,6 +1064,29 @@ function computeN50GT(n50: N50State): N50GTAnalysis {
     }
   }
 
+  // Per-component agree/neutral/diverge vs gt direction
+  const dirSign = gtDirection === 'BULL' ? 1 : gtDirection === 'BEAR' ? -1 : 0
+  function checkSign(val: number): number {
+    if (dirSign === 0) return 0
+    if (val * dirSign > 0.05) return 1
+    if (val * dirSign < -0.05) return -1
+    return 0
+  }
+  const checks = {
+    mp: mpStrike != null ? checkSign(mpC) : 0,
+    pcr: pcr != null ? checkSign(pcrC) : 0,
+    sch: wallPosition != null ? (wallPosition === 'IN_RANGE' ? 0 : checkSign(schC)) : 0,
+    orc: checkSign(orcC),
+    micro: checkSign(microC),
+  }
+  const agreementCount = Object.values(checks).filter(v => v === 1).length
+  const divergeCount = Object.values(checks).filter(v => v === -1).length
+  const setupLabel: N50GTAnalysis['setupLabel'] =
+    gtDirection === 'NEUTRAL' ? 'CONFLICTED' :
+    agreementCount >= 5 ? 'PERFECT' :
+    agreementCount >= 4 ? 'STRONG' :
+    agreementCount >= 3 ? 'PARTIAL' : 'WEAK'
+
   return {
     maxPainStrike: mpStrike, maxPainDir: mpDir, maxPainDistPct: mpDistPct, maxPainPull: mpPull,
     pcr, pcrSignal, pcrInterp,
@@ -1066,7 +1094,9 @@ function computeN50GT(n50: N50State): N50GTAnalysis {
     regime, oracleAlignment, microDir,
     gtScore: clamped, gtDirection, gtConviction,
     components: { mpC, pcrC, schC, orcC, microC },
+    checks, agreementCount, divergeCount,
     oracleTarget, oracleTargetPct, nashTarget, nashTargetPct, gtTarget, gtTargetPct,
+    setupLabel,
   }
 }
 
@@ -1236,121 +1266,183 @@ function N50GTPanel({ n50 }: { n50: N50State }) {
     gt.regime === 'CHOP' ? 'var(--text3)' : 'rgba(255,255,255,0.25)'
 
   const noOI = !n50.oiAnalytics
-  const scoreBarW = 160
+  const scoreBarW = 140
   const scoreFill = Math.abs(gt.gtScore) * (scoreBarW / 2)
+  const pa = n50.phaseAnalysis
 
-  const compRow = (label: string, val: number, signal: string | null, sigColor: string, extra?: string) => (
-    <div key={label} style={{ display: 'grid', gridTemplateColumns: '90px 1fr 90px', alignItems: 'center', gap: '6px', fontSize: '10px' }}>
-      <span style={{ color: 'var(--text3)', textAlign: 'right' }}>{label}</span>
-      <div style={{ position: 'relative', height: '6px', background: 'rgba(255,255,255,0.06)', borderRadius: '3px' }}>
-        <div style={{ position: 'absolute', top: 0, height: '100%', background: val > 0 ? 'var(--bull)' : val < 0 ? 'var(--bear)' : 'rgba(255,255,255,0.15)', borderRadius: '3px', width: `${Math.abs(val) * 50}%`, [val >= 0 ? 'left' : 'right']: '50%', maxWidth: '50%' }} />
-        <div style={{ position: 'absolute', top: 0, left: '50%', width: '1px', height: '100%', background: 'rgba(255,255,255,0.15)' }} />
-      </div>
-      <span style={{ color: sigColor, fontWeight: 700, fontSize: '9px' }}>{signal ?? '—'}{extra ? ` ${extra}` : ''}</span>
+  // Setup label color
+  const setupColor = gt.setupLabel === 'PERFECT' || gt.setupLabel === 'STRONG' ? '#eab308'
+    : gt.setupLabel === 'PARTIAL' ? 'var(--text2)'
+    : gt.setupLabel === 'CONFLICTED' ? 'var(--bear)' : 'var(--text3)'
+
+  // Checklist item renderer
+  const checkItem = (icon: '✓' | '✗' | '~', label: string, detail: string, iconColor: string) => (
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: '5px', fontSize: '10px', lineHeight: 1.4 }}>
+      <span style={{ color: iconColor, fontWeight: 900, fontSize: '11px', flexShrink: 0, width: '12px' }}>{icon}</span>
+      <span style={{ color: 'var(--text2)', fontWeight: 700, flexShrink: 0, minWidth: '68px' }}>{label}</span>
+      <span style={{ color: 'var(--text3)' }}>{detail}</span>
     </div>
   )
+
+  // Per-check icon+color
+  function checkIC(v: number): ['✓' | '✗' | '~', string] {
+    return v === 1 ? ['✓', 'var(--bull)'] : v === -1 ? ['✗', 'var(--bear)'] : ['~', 'var(--text3)']
+  }
+
+  // OI range visualization — spot between put wall and call wall
+  const showRange = gt.putWallStrike != null && gt.callWallStrike != null && spot > 0
+  const rangeW = showRange ? Math.max(1, gt.callWallStrike! - gt.putWallStrike!) : 1
+  const spotPct = showRange ? Math.max(0, Math.min(1, (spot - gt.putWallStrike!) / rangeW)) : 0
+  const mpPct   = showRange && gt.maxPainStrike != null
+    ? Math.max(0, Math.min(1, (gt.maxPainStrike - gt.putWallStrike!) / rangeW)) : null
+
+  // Regime trading instruction (compact, actionable)
+  const regimeInstruction: Record<string, string> = {
+    ACCUMULATION: 'Follow CD not book — hidden BULL phase',
+    MARKUP:       'Visible momentum — full BULL weight',
+    DISTRIBUTION: 'Follow CD not book — hidden BEAR phase',
+    MARKDOWN:     'Visible selling — full BEAR weight',
+    CHOP:         'No dominant player — OI signals halved',
+    UNKNOWN:      'Conflicting signals — wait for clarity',
+  }
+
+  // Entry verdict text
+  const verdictText =
+    gt.setupLabel === 'PERFECT'    ? `ENTER — all 5 signals agree ${gt.gtDirection}` :
+    gt.setupLabel === 'STRONG'     ? `CONSIDER — 4/5 agree, 1 neutral/diverge` :
+    gt.setupLabel === 'PARTIAL'    ? `WATCH — 3/5 agree, setup developing` :
+    gt.setupLabel === 'WEAK'       ? `WAIT — fewer than 3 signals aligned` :
+                                     `NO SETUP — direction unclear`
 
   return (
     <>
       <div
         onContextMenu={e => { e.preventDefault(); setCtxMenu({ x: e.clientX, y: e.clientY }) }}
-        style={{ padding: '8px 10px', background: CYB.panel, borderRadius: '6px', border: `1px solid ${CYB.glowBorder}`, display: 'flex', flexDirection: 'column', gap: '8px', cursor: 'context-menu' }}
+        style={{ padding: '8px 10px', background: CYB.panel, borderRadius: '6px', border: `1px solid ${CYB.glowBorder}`, display: 'flex', flexDirection: 'column', gap: '7px', cursor: 'context-menu' }}
       >
-        {/* Header */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+        {/* ── Header ─────────────────────────────────────────────── */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
           <span style={{ fontSize: '8px', fontWeight: 700, color: CYB.glow, letterSpacing: '0.15em' }}>{'//GT_ENGINE'}</span>
           <span style={{ fontSize: '8px', color: '#eab308', border: `1px solid ${'#eab308'}44`, borderRadius: '3px', padding: '0 4px', fontWeight: 700 }}>ADMIN</span>
           <span style={{ flex: 1 }} />
-          <span style={{ fontSize: '8px', color: 'var(--text3)', opacity: 0.5 }}>right-click to explain</span>
+          <span style={{ fontSize: '8px', color: 'var(--text3)', opacity: 0.45 }}>right-click · explain</span>
         </div>
 
-        {/* GT Score row */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: '6px' }}>
-            <span style={{ fontSize: '18px', fontWeight: 900, color: gtColor, lineHeight: 1 }}>{gt.gtDirection}</span>
-            <span style={{ fontSize: '11px', fontWeight: 700, color: convColor }}>{gt.gtConviction}</span>
-          </div>
+        {/* ── Direction + Score + Agreement ──────────────────────── */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: '20px', fontWeight: 900, color: gtColor, lineHeight: 1 }}>{gt.gtDirection}</span>
+          {/* Score bar */}
           <div style={{ position: 'relative', width: `${scoreBarW}px`, height: '8px', background: 'rgba(255,255,255,0.06)', borderRadius: '4px', flexShrink: 0 }}>
             <div style={{ position: 'absolute', top: 0, height: '100%', width: `${scoreFill}px`, background: gtColor, borderRadius: '4px', [gt.gtScore >= 0 ? 'left' : 'right']: '50%', maxWidth: '50%' }} />
             <div style={{ position: 'absolute', top: 0, left: '50%', width: '1px', height: '100%', background: 'rgba(255,255,255,0.2)' }} />
           </div>
-          <span style={{ fontSize: '10px', color: 'var(--text3)' }}>{gt.gtScore >= 0 ? '+' : ''}{gt.gtScore.toFixed(3)}</span>
+          <span style={{ fontSize: '10px', color: 'var(--text3)', minWidth: '38px' }}>{gt.gtScore >= 0 ? '+' : ''}{gt.gtScore.toFixed(3)}</span>
+          {/* Agreement badge */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '4px', marginLeft: 'auto' }}>
+            <span style={{ fontSize: '13px', fontWeight: 900, color: setupColor }}>{gt.agreementCount}/5</span>
+            <span style={{ fontSize: '9px', fontWeight: 700, color: setupColor }}>{gt.setupLabel}</span>
+          </div>
         </div>
 
-        {/* Price prediction */}
-        {gt.gtTarget != null && gt.gtDirection !== 'NEUTRAL' && (
-          <div style={{ background: 'rgba(255,255,255,0.03)', borderRadius: '4px', padding: '5px 8px', display: 'flex', flexDirection: 'column', gap: '3px' }}>
-            <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px', flexWrap: 'wrap' }}>
-              <span style={{ fontSize: '8px', color: 'var(--text3)', letterSpacing: '0.1em', fontWeight: 700 }}>GT TARGET</span>
-              <span style={{ fontSize: '14px', fontWeight: 900, color: gt.gtTargetPct! > 0 ? 'var(--bull)' : 'var(--bear)', lineHeight: 1 }}>
-                ₹{gt.gtTarget.toFixed(0)}
-              </span>
-              <span style={{ fontSize: '11px', fontWeight: 700, color: gt.gtTargetPct! > 0 ? 'var(--bull)' : 'var(--bear)' }}>
-                {gt.gtTargetPct! >= 0 ? '+' : ''}{gt.gtTargetPct!.toFixed(2)}%
-              </span>
+        {/* ── OI Range Visualization ─────────────────────────────── */}
+        {showRange ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+            {/* price labels */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '8px', color: 'var(--text3)' }}>
+              <span style={{ color: 'var(--bull)' }}>PUT ₹{gt.putWallStrike!.toFixed(0)}</span>
+              {gt.maxPainStrike != null && <span style={{ color: '#eab308' }}>PAIN ₹{gt.maxPainStrike.toFixed(0)}</span>}
+              <span style={{ color: 'var(--bear)' }}>CALL ₹{gt.callWallStrike!.toFixed(0)}</span>
             </div>
-            <div style={{ display: 'flex', gap: '8px', fontSize: '9px', color: 'var(--text3)', flexWrap: 'wrap' }}>
-              {gt.oracleTargetPct != null && (
-                <span>oracle {gt.oracleTargetPct >= 0 ? '+' : ''}{gt.oracleTargetPct.toFixed(2)}% → ₹{gt.oracleTarget!.toFixed(0)}</span>
+            {/* range bar */}
+            <div style={{ position: 'relative', height: '12px', background: 'rgba(255,255,255,0.05)', borderRadius: '3px', overflow: 'hidden' }}>
+              {/* bull zone (left) */}
+              <div style={{ position: 'absolute', left: 0, top: 0, width: `${spotPct * 100}%`, height: '100%', background: 'rgba(var(--bull-rgb,34,197,94),0.18)' }} />
+              {/* bear zone (right) */}
+              <div style={{ position: 'absolute', right: 0, top: 0, width: `${(1 - spotPct) * 100}%`, height: '100%', background: 'rgba(var(--bear-rgb,239,68,68),0.18)' }} />
+              {/* max pain marker */}
+              {mpPct != null && (
+                <div style={{ position: 'absolute', top: 0, left: `${mpPct * 100}%`, width: '2px', height: '100%', background: '#eab308', opacity: 0.7 }} />
               )}
-              {gt.nashTargetPct != null && (
-                <span>·  nash {gt.nashTargetPct >= 0 ? '+' : ''}{gt.nashTargetPct.toFixed(2)}% → ₹{gt.nashTarget!.toFixed(0)}</span>
-              )}
+              {/* spot marker */}
+              <div style={{ position: 'absolute', top: '1px', left: `${spotPct * 100}%`, transform: 'translateX(-50%)', width: '3px', height: 'calc(100% - 2px)', background: 'white', borderRadius: '2px' }} />
+            </div>
+            {/* spot reading */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '8px', color: 'var(--text3)' }}>
+              <span>
+                {gt.wallPosition === 'ABOVE_RESISTANCE' ? <span style={{ color: 'var(--bull)', fontWeight: 700 }}>↑ ABOVE resistance</span>
+                  : gt.wallPosition === 'BELOW_SUPPORT' ? <span style={{ color: 'var(--bear)', fontWeight: 700 }}>↓ BELOW support</span>
+                  : <span>in range · {(spotPct * 100).toFixed(0)}% from put wall</span>}
+              </span>
+              <span>spot ₹{spot.toFixed(0)}</span>
             </div>
           </div>
-        )}
+        ) : noOI ? (
+          <div style={{ fontSize: '9px', color: 'var(--text3)', opacity: 0.5, fontStyle: 'italic' }}>OI chain loading — max pain · PCR · walls pending</div>
+        ) : null}
 
-        {/* Component breakdown */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-          {compRow('max pain', gt.components.mpC,
-            gt.maxPainDir ?? (noOI ? 'no OI' : '—'),
-            gt.maxPainDir === 'BULL' ? 'var(--bull)' : gt.maxPainDir === 'BEAR' ? 'var(--bear)' : 'var(--text3)',
-            gt.maxPainStrike != null ? `₹${gt.maxPainStrike.toFixed(0)} pull:${gt.maxPainPull.toFixed(0)}%` : undefined,
-          )}
-          {compRow('PCR',
-            gt.components.pcrC,
-            gt.pcr != null ? `${gt.pcr.toFixed(2)}` : (noOI ? 'no OI' : '—'),
-            gt.pcrSignal === 'BULL' ? 'var(--bull)' : gt.pcrSignal === 'BEAR' ? 'var(--bear)' : 'var(--text3)',
-            gt.pcrSignal != null && gt.pcrSignal !== 'NEUTRAL' ? `(${gt.pcrSignal})` : undefined,
-          )}
-          {compRow('OI walls',
-            gt.components.schC,
-            gt.wallPosition === 'ABOVE_RESISTANCE' ? '↑BREAK' : gt.wallPosition === 'BELOW_SUPPORT' ? '↓BREAK' : gt.wallPosition === 'IN_RANGE' ? `${(gt.wallRangeUsed * 100).toFixed(0)}%` : (noOI ? 'no OI' : '—'),
-            gt.wallPosition === 'ABOVE_RESISTANCE' ? 'var(--bull)' : gt.wallPosition === 'BELOW_SUPPORT' ? 'var(--bear)' : 'var(--text3)',
-            gt.callWallStrike != null ? `${gt.putWallStrike?.toFixed(0)}–${gt.callWallStrike?.toFixed(0)}` : undefined,
-          )}
-          {compRow('oracle',
-            gt.components.orcC,
-            n50.composite.direction ?? 'NEUTRAL',
-            n50.composite.direction === 'BULL' ? 'var(--bull)' : n50.composite.direction === 'BEAR' ? 'var(--bear)' : 'var(--text3)',
-            `${(n50.composite.confidence * 100).toFixed(0)}%conf`,
-          )}
-          {compRow('micro CD+CUSUM',
-            gt.components.microC,
-            gt.microDir,
-            gt.microDir === 'BULL' ? 'var(--bull)' : gt.microDir === 'BEAR' ? 'var(--bear)' : 'var(--text3)',
-            `cdZ:${n50.technicals.avgCdZ.toFixed(1)}σ`,
-          )}
+        {/* ── Signal Checklist ───────────────────────────────────── */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1px', borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '6px' }}>
+          {(() => {
+            const [mpI, mpC2] = checkIC(gt.checks.mp)
+            const mpDetail = gt.maxPainStrike != null
+              ? `₹${gt.maxPainStrike.toFixed(0)} · ${gt.maxPainDistPct != null ? `${gt.maxPainDistPct > 0 ? '+' : ''}${gt.maxPainDistPct.toFixed(2)}% away · pull ${gt.maxPainPull.toFixed(0)}%` : ''}`
+              : 'no OI data'
+            const [pcrI, pcrC2] = checkIC(gt.checks.pcr)
+            const pcrDetail = gt.pcr != null
+              ? `${gt.pcr.toFixed(2)} — ${gt.pcrSignal === 'BULL' ? 'call-heavy (costly BULL)' : gt.pcrSignal === 'BEAR' ? 'put-heavy (costly BEAR)' : 'balanced (no bias)'}`
+              : 'no OI data'
+            const [schI, schC2] = checkIC(gt.checks.sch)
+            const schDetail = gt.wallPosition === 'ABOVE_RESISTANCE' ? '↑ broke call wall (bullish)'
+              : gt.wallPosition === 'BELOW_SUPPORT' ? '↓ broke put wall (bearish)'
+              : gt.wallPosition === 'IN_RANGE' ? `in range ${(gt.wallRangeUsed * 100).toFixed(0)}% — no breakout`
+              : 'no OI data'
+            const [orcI, orcC2] = checkIC(gt.checks.orc)
+            const orcDetail = `${n50.composite.direction ?? 'NEUTRAL'} ${(n50.composite.confidence * 100).toFixed(0)}% · n=${n50.snapshotCount}`
+            const [micI, micC2] = checkIC(gt.checks.micro)
+            const micDetail = `CD Z ${n50.technicals.avgCdZ >= 0 ? '+' : ''}${n50.technicals.avgCdZ.toFixed(2)}σ · CUSUM B:${n50.technicals.cusumBullCount} S:${n50.technicals.cusumBearCount}`
+            return (<>
+              {checkItem(mpI,  'MAX PAIN',  mpDetail,  mpC2)}
+              {checkItem(pcrI, 'PCR',       pcrDetail, pcrC2)}
+              {checkItem(schI, 'OI WALLS',  schDetail, schC2)}
+              {checkItem(orcI, 'ORACLE',    orcDetail, orcC2)}
+              {checkItem(micI, 'CD+CUSUM',  micDetail, micC2)}
+            </>)
+          })()}
         </div>
 
-        {/* Regime + alignment footer */}
-        <div style={{ display: 'flex', gap: '10px', alignItems: 'center', borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '5px', flexWrap: 'wrap' }}>
-          <span style={{ fontSize: '9px', color: 'var(--text3)' }}>regime:</span>
-          <span style={{ fontSize: '9px', fontWeight: 700, color: regimeColor }}>{regimeEmoji[gt.regime]} {gt.regime}</span>
-          {gt.regime === 'CHOP' && <span style={{ fontSize: '8px', color: 'var(--text3)' }}>→ OI weights ½</span>}
-          <span style={{ flex: 1 }} />
-          {gt.oracleAlignment && (
-            <span style={{ fontSize: '9px', fontWeight: 700, color: gt.oracleAlignment === 'ALIGNED' ? 'var(--bull)' : gt.oracleAlignment === 'DIVERGING' ? 'var(--bear)' : 'var(--text3)' }}>
-              {gt.oracleAlignment === 'ALIGNED' ? '✓ ALIGNED' : gt.oracleAlignment === 'DIVERGING' ? '⚠ DIVERGING' : '~ NEUTRAL'}
-            </span>
-          )}
-        </div>
-
-        {noOI && (
-          <div style={{ fontSize: '9px', color: 'var(--text3)', opacity: 0.6, fontStyle: 'italic' }}>
-            max pain + PCR + OI walls pending chain load
+        {/* ── Entry Verdict ──────────────────────────────────────── */}
+        <div style={{
+          borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '6px',
+          display: 'flex', flexDirection: 'column', gap: '3px',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <span style={{ fontSize: '9px', fontWeight: 900, color: setupColor, letterSpacing: '0.05em' }}>{verdictText}</span>
           </div>
-        )}
+          {/* Target line */}
+          {gt.gtTarget != null && gt.gtDirection !== 'NEUTRAL' && (
+            <div style={{ fontSize: '9px', color: 'var(--text3)', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              <span>target <span style={{ color: gtColor, fontWeight: 700 }}>₹{gt.gtTarget.toFixed(0)}</span>
+                <span style={{ color: gtColor }}> ({gt.gtTargetPct! >= 0 ? '+' : ''}{gt.gtTargetPct!.toFixed(2)}%)</span>
+              </span>
+              {gt.oracleTargetPct != null && <span>oracle ₹{gt.oracleTarget!.toFixed(0)}</span>}
+              {gt.nashTargetPct != null && <span>pain ₹{gt.nashTarget!.toFixed(0)}</span>}
+            </div>
+          )}
+          {/* Regime + phase compact row */}
+          <div style={{ display: 'flex', gap: '8px', fontSize: '8px', color: 'var(--text3)', flexWrap: 'wrap', alignItems: 'center' }}>
+            <span style={{ color: regimeColor, fontWeight: 700 }}>{regimeEmoji[gt.regime]} {gt.regime}</span>
+            <span>—</span>
+            <span>{regimeInstruction[gt.regime]}</span>
+            {pa && pa.phase !== 'UNKNOWN' && (
+              <>
+                <span>·</span>
+                <span style={{ color: pa.obiCdPhase === 'HIDDEN' ? '#fbbf24' : pa.obiCdPhase === 'VISIBLE' ? '#34d399' : 'var(--text3)', fontWeight: 700 }}>
+                  phase {pa.phase}·{pa.obiCdPhase}
+                </span>
+              </>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* Context menu */}
