@@ -4,6 +4,7 @@ import { IndicatorEngine, type IndicatorValues } from './indicators'
 import { kiteGetLTP, kiteGetQuote, kiteGetHistorical } from './kite'
 import { getNiftyContracts, fetchNiftyChainOI, getCachedNiftyOI, type NiftyOIAnalytics, type NiftyContracts } from './niftyContracts'
 import { getISTHourMin } from './tradingCalendar'
+import { computeOTSState, type OTSState } from './optTradeSys'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -614,6 +615,20 @@ export interface MetaRegimeData {
   momentumSlope: number
 }
 
+// ── Phase Analysis types ──────────────────────────────────────────────────────
+
+export interface PhaseAnalysis {
+  phase: 'START' | 'MID' | 'END' | 'UNKNOWN'
+  phaseConfidence: number       // 0–1
+  stability: 'STABLE' | 'TRANSITIONING' | 'NOISY'
+  stabilityScore: number        // mean cosine similarity of consecutive vectors (0–1)
+  cdVelTrend: 'RISING' | 'FLAT' | 'FALLING'
+  cdVelSlope: number            // raw OLS slope of cdZ over last 12 snapshots
+  obiCdAlignment: 'HIDDEN' | 'VISIBLE' | 'NEUTRAL'
+  regimeDurationMin: number     // minutes current regime has been active
+  trendDirection: 'BULL' | 'BEAR' | null
+}
+
 // ── Main NiftyFutState export type ────────────────────────────────────────────
 
 export interface NiftyFutState {
@@ -637,6 +652,8 @@ export interface NiftyFutState {
   elliottWaveByTF: Partial<Record<string, ElliottWaveState>>
   metaRegime: MetaRegimeData | null
   v2: NiftyV2 | null
+  phaseAnalysis: PhaseAnalysis | null
+  otsState: OTSState | null
   depth?: {
     buy: { price: number; quantity: number; orders: number }[]
     sell: { price: number; quantity: number; orders: number }[]
@@ -993,6 +1010,114 @@ export function computeNiftyMetaRegime(patterns: NiftyPattern[], n = 60): MetaRe
   const confidence = Math.min(1, (Math.abs(avgCdZ) / 0.4) * Math.abs(bullBias - bearBias))
 
   return { regime, confidence, avgCdZ, avgObi, divergenceScore, momentumSlope }
+}
+
+// ── Phase Analysis ────────────────────────────────────────────────────────────
+
+export function computePhaseAnalysis(
+  patternsV2: PatternV2[],
+  metaRegime: MetaRegimeData | null,
+): PhaseAnalysis {
+  const trendDirection: 'BULL' | 'BEAR' | null =
+    metaRegime?.regime === 'ACCUMULATION' || metaRegime?.regime === 'MARKUP' ? 'BULL' :
+    metaRegime?.regime === 'DISTRIBUTION' || metaRegime?.regime === 'MARKDOWN' ? 'BEAR' : null
+
+  // 1. Feature stability — mean cosine similarity between last 6 consecutive V2 vectors
+  const stabilitySlice = patternsV2.slice(-6)
+  let stabilityScore = 0.5
+  if (stabilitySlice.length >= 2) {
+    const cosScores: number[] = []
+    for (let i = 1; i < stabilitySlice.length; i++) {
+      cosScores.push(Math.max(0, cosineSim(stabilitySlice[i].vec, stabilitySlice[i - 1].vec)))
+    }
+    stabilityScore = cosScores.reduce((a, b) => a + b, 0) / cosScores.length
+  }
+  const stability: 'STABLE' | 'TRANSITIONING' | 'NOISY' =
+    stabilityScore > 0.80 ? 'STABLE' :
+    stabilityScore > 0.50 ? 'TRANSITIONING' : 'NOISY'
+
+  // 2. cdZ trajectory — OLS slope of V2 vec[0] (cdZ) over last 12 snapshots
+  const cdZSlice = patternsV2.slice(-12).map(p => p.vec[0])
+  const cdVelSlope = _linSlope(cdZSlice)
+  const cdVelTrend: 'RISING' | 'FLAT' | 'FALLING' =
+    cdVelSlope > 0.02 ? 'RISING' :
+    cdVelSlope < -0.02 ? 'FALLING' : 'FLAT'
+
+  // 3. OBI/CD alignment from divergenceScore (fraction of snapshots where cdZ and OBI disagree)
+  // High divergence = hidden phase (Kyle accumulation/distribution) = early trend
+  // Low divergence  = visible phase (Stackelberg markup/markdown) = mid trend
+  const div = metaRegime?.divergenceScore ?? 0.5
+  const obiCdAlignment: 'HIDDEN' | 'VISIBLE' | 'NEUTRAL' =
+    div > 0.35 ? 'HIDDEN' :
+    div < 0.20 ? 'VISIBLE' : 'NEUTRAL'
+
+  // 4. Regime duration — scan backward through V2 to find when current regime started
+  let regimeDurationMin = 0
+  if (metaRegime && patternsV2.length >= 2 && metaRegime.regime !== 'UNKNOWN') {
+    const cdBull = metaRegime.avgCdZ > 0.15
+    const cdBear = metaRegime.avgCdZ < -0.15
+    let i = patternsV2.length - 1
+    while (i >= 0) {
+      const cdZ = patternsV2[i].vec[0]
+      const same = cdBull ? cdZ > 0.0 : cdBear ? cdZ < 0.0 : Math.abs(cdZ) <= 0.2
+      if (!same) break
+      i--
+    }
+    const startTs = i >= 0 ? (patternsV2[i + 1]?.ts ?? 0) : (patternsV2[0]?.ts ?? 0)
+    regimeDurationMin = startTs > 0 ? Math.round((Date.now() - startTs) / 60_000) : 0
+  }
+
+  // 5. Phase scoring: START / MID / END
+  let phase: 'START' | 'MID' | 'END' | 'UNKNOWN' = 'UNKNOWN'
+  let phaseConfidence = 0
+
+  const isChop = !metaRegime || metaRegime.regime === 'CHOP' || metaRegime.regime === 'UNKNOWN'
+  if (patternsV2.length < 5 || isChop) {
+    phase = 'UNKNOWN'
+    phaseConfidence = 0
+  } else {
+    let startScore = 0, midScore = 0, endScore = 0
+
+    // cdVelZ trajectory — most direct phase signal
+    if (cdVelTrend === 'RISING')  startScore += 2.5   // momentum just building
+    else if (cdVelTrend === 'FLAT') midScore += 2.0   // sustained
+    else endScore += 2.5                               // fading
+
+    // OBI/CD alignment (Kyle model phase)
+    if (obiCdAlignment === 'HIDDEN')       startScore += 2.0  // hidden = accumulation = early
+    else if (obiCdAlignment === 'VISIBLE') midScore   += 1.5  // visible = markup = mid
+    if (obiCdAlignment === 'VISIBLE' && cdVelTrend === 'FALLING') endScore += 1.0  // exhaustion
+
+    // Regime duration
+    if (regimeDurationMin < 8)       startScore += 1.5
+    else if (regimeDurationMin < 30) midScore   += 1.5
+    else                             endScore   += 2.0  // long-running = likely exhausting
+
+    // Feature stability
+    if (stability === 'NOISY')   startScore += 0.5  // noisy = transitioning = start
+    if (stability === 'STABLE')  midScore   += 0.5
+
+    // Regime confidence
+    if (metaRegime.confidence < 0.3)      startScore += 0.5
+    else if (metaRegime.confidence > 0.6) midScore   += 0.5
+
+    const total = startScore + midScore + endScore
+    if (total > 0) {
+      const maxScore = Math.max(startScore, midScore, endScore)
+      phaseConfidence = Math.min(0.95, maxScore / total)
+      if (startScore >= midScore && startScore >= endScore) phase = 'START'
+      else if (midScore >= startScore && midScore >= endScore) phase = 'MID'
+      else phase = 'END'
+    }
+  }
+
+  return {
+    phase, phaseConfidence, stability, stabilityScore,
+    cdVelTrend, cdVelSlope,
+    obiCdAlignment,
+    regimeDurationMin,
+    trendDirection,
+  }
 }
 
 // ── NSE Session classifier ────────────────────────────────────────────────────
@@ -1737,13 +1862,13 @@ const NIFTY_FUT_STATE_FILE = path.join('/workspace/option-trader', 'nifty-fut-st
 function readNiftyFutTick(): {
   ltp: number; depth: any; volume: number; oi: number; cumDelta: number;
   cdZScore: number; aggressionRatio: number; cusumPos: number; cusumNeg: number;
-  symbol: string; token: number
+  symbol: string; token: number; fresh: boolean
 } | null {
   try {
     const raw = fs.readFileSync(NIFTY_FUT_STATE_FILE, 'utf8')
     const data = JSON.parse(raw)
-    if (Date.now() - data.updatedAt > 120_000) return null  // stale > 2min
-    return data
+    const fresh = Date.now() - data.updatedAt <= 120_000
+    return { ...data, fresh }  // always return — caller uses `fresh` to decide what to trust
   } catch { return null }
 }
 
@@ -1772,29 +1897,39 @@ export async function getNiftyFutState(): Promise<NiftyFutState> {
   let futureToken = ps.instrumentToken
 
   const tick = readNiftyFutTick()
-  if (tick && tick.ltp > 0) {
-    spot = tick.ltp
-    depth = tick.depth
-    volume = tick.volume ?? 0
-    oi = tick.oi ?? 0
-    futureSymbol = tick.symbol ?? ''
+  if (tick) {
+    // Always seed token/symbol from file (even if stale) so REST fallback can work
     if (tick.token > 0) {
       ps.instrumentToken = tick.token
       futureToken = tick.token
     }
-    if (typeof tick.cumDelta === 'number') {
-      const alarm = tick.cusumPos >= CUSUM_H ? 'BULL'
-        : tick.cusumNeg >= CUSUM_H ? 'BEAR' : null
-      flowState = {
-        cumDelta:        tick.cumDelta ?? 0,
-        cdZScore:        tick.cdZScore ?? 0,
-        aggressionRatio: tick.aggressionRatio ?? 0,
-        cusumPos:        tick.cusumPos ?? 0,
-        cusumNeg:        tick.cusumNeg ?? 0,
-        cusumAlarm:      alarm,
+    if (tick.symbol) futureSymbol = tick.symbol
+
+    if (tick.fresh && tick.ltp > 0) {
+      // Fresh data from bot WebSocket feed
+      spot = tick.ltp
+      depth = tick.depth
+      volume = tick.volume ?? 0
+      oi = tick.oi ?? 0
+      if (typeof tick.cumDelta === 'number') {
+        const alarm = tick.cusumPos >= CUSUM_H ? 'BULL'
+          : tick.cusumNeg >= CUSUM_H ? 'BEAR' : null
+        flowState = {
+          cumDelta:        tick.cumDelta ?? 0,
+          cdZScore:        tick.cdZScore ?? 0,
+          aggressionRatio: tick.aggressionRatio ?? 0,
+          cusumPos:        tick.cusumPos ?? 0,
+          cusumNeg:        tick.cusumNeg ?? 0,
+          cusumAlarm:      alarm,
+        }
+        ps.lastFlowState = flowState
+        ps.lastFlowStateAt = Date.now()
       }
-      ps.lastFlowState = flowState
-      ps.lastFlowStateAt = Date.now()
+    } else if (!marketOpen && tick.ltp > 0) {
+      // Market closed: use last-known LTP from state file so pattern data renders
+      spot = tick.ltp
+      volume = tick.volume ?? 0
+      oi = tick.oi ?? 0
     }
   }
 
@@ -1803,10 +1938,9 @@ export async function getNiftyFutState(): Promise<NiftyFutState> {
     flowState = ps.lastFlowState
   }
 
-  // Fallback: Kite REST API (when bot isn't running) — need symbol from instruments CSV
+  // Fallback: Kite REST API (when bot isn't running but token is valid)
   if (spot <= 0) {
     try {
-      // Try to get NIFTY futures from instruments if we have a token
       if (futureToken > 0) {
         const quoteKey = `NFO:${futureSymbol || 'NIFTY26JUNFUT'}`
         try {
@@ -2078,6 +2212,14 @@ export async function getNiftyFutState(): Promise<NiftyFutState> {
     ? computeNiftyMetaRegime(store.patterns, 60)
     : null
 
+  const phaseAnalysis = ps.patternsV2[sessionKey].length >= 5
+    ? computePhaseAnalysis(ps.patternsV2[sessionKey], metaRegime)
+    : null
+
+  const otsState = computeOTSState({
+    spot, phase: phaseAnalysis, metaRegime, v2, composite, technicals, chain, marketOpen,
+  })
+
   return {
     prediction, technicals, composite,
     snapshotCount: store.snapshots.length,
@@ -2085,7 +2227,7 @@ export async function getNiftyFutState(): Promise<NiftyFutState> {
     resolvedCount: store.patterns.filter(p => p.outcome20 !== null).length,
     proxy, minutesAccumulated, sysLog, p20cSysLog, chain,
     spot, futureSymbol, futureToken,
-    marketOpen, depth, pat20Con, elliottWave, elliottWaveByTF, metaRegime, v2,
+    marketOpen, depth, pat20Con, elliottWave, elliottWaveByTF, metaRegime, v2, phaseAnalysis, otsState,
   }
 }
 
@@ -2108,6 +2250,6 @@ function emptyState(marketOpen: boolean): NiftyFutState {
     composite: { predictedMove: 0, bullProb: 0.5, bearProb: 0.5, direction: null, confidence: 0, status: 'no_data', components: { patternWeight: 0, techWeight: 0, patternBullProb: 0.5, techBullScore: 0.5 } },
     snapshotCount: 0, patternCount: 0, resolvedCount: 0, proxy: 0, minutesAccumulated: 0,
     sysLog: [], p20cSysLog: [], chain: null, spot: 0, futureSymbol: '', futureToken: 0,
-    marketOpen, pat20Con: null, elliottWave: null, elliottWaveByTF: {}, metaRegime: null, v2: null,
+    marketOpen, pat20Con: null, elliottWave: null, elliottWaveByTF: {}, metaRegime: null, v2: null, phaseAnalysis: null, otsState: null,
   }
 }
