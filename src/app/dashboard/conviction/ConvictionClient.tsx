@@ -186,6 +186,57 @@ interface N50State {
     knnConsistency: 'ALIGNED' | 'MIXED' | 'INSUFFICIENT'
     knnConsistencyDetail: string
   }
+  hero?: {
+    armed: boolean
+    position: {
+      id: string
+      direction: 'BULL' | 'BEAR'
+      entryTs: number
+      entrySpot: number
+      legs: Array<{
+        label: 'NEAR' | 'MID' | 'FAR'
+        symbol: string
+        strike: number
+        optionType: 'CE' | 'PE'
+        lots: number
+        entryPremium: number
+        currentPremium: number
+        peakPremium: number
+        tpLow: number; tpMid: number; tpHigh: number
+        slTight: number; slMid: number; slWide: number
+        status: 'OPEN' | 'EXITED'
+        exitTs?: number
+        exitPremium?: number
+        exitReason?: string
+        pnl?: number
+      }>
+      gtScoreAtEntry: number
+      oracleDirAtEntry: 'BULL' | 'BEAR' | null
+      oracleConfAtEntry: number
+      phaseAtEntry: string
+      oraclePredMoveAtEntry: number
+      momTier: 'TIGHT' | 'MID' | 'WIDE'
+      lastGtScore: number
+      totalPnl: number
+    } | null
+    closedPositions: Array<{
+      id: string
+      direction: 'BULL' | 'BEAR'
+      entryTs: number
+      legs: Array<{ label: 'NEAR' | 'MID' | 'FAR'; pnl?: number; exitReason?: string; status: 'OPEN' | 'EXITED' }>
+      totalPnl: number
+    }>
+    log: Array<{
+      ts: number
+      act: 'ENTRY' | 'EXIT_LEG' | 'EXIT_ALL' | 'HOLD' | 'SKIP' | 'TIER_CHANGE' | 'ERR'
+      msg: string
+      pnl?: number
+      leg?: 'NEAR' | 'MID' | 'FAR'
+      dir?: 'BULL' | 'BEAR'
+    }>
+    stats: { trades: number; wins: number; pnl: number }
+    lastTickTs: number
+  }
 }
 
 interface ConvictionResult {
@@ -3912,6 +3963,152 @@ function TelegramSettingsPanel({ onClose }: { onClose: () => void }) {
   )
 }
 
+// ── HeroPanel ────────────────────────────────────────────────────────────────
+
+type HeroStateLocal = NonNullable<N50State['hero']>
+type HeroPositionLocal = NonNullable<HeroStateLocal['position']>
+type HeroLegLocal = HeroPositionLocal['legs'][number]
+
+function HeroLegRow({ leg }: { leg: HeroLegLocal }) {
+  const pnlPct = leg.entryPremium > 0 ? ((leg.currentPremium - leg.entryPremium) / leg.entryPremium * 100) : 0
+  const isOpen = leg.status === 'OPEN'
+  const legColor = leg.label === 'NEAR' ? '#4ecdc4' : leg.label === 'MID' ? '#ffd93d' : '#ff6b6b'
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: '40px 1fr auto auto auto auto', gap: '4px 8px', alignItems: 'center', padding: '4px 0', borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+      <span style={{ fontSize: '8px', fontWeight: 700, color: legColor, background: `${legColor}18`, borderRadius: '3px', padding: '1px 4px', textAlign: 'center' }}>{leg.label}</span>
+      <span style={{ fontSize: '9px', color: 'var(--text2)', fontFamily: 'monospace' }}>{leg.symbol.slice(-12)}</span>
+      <span style={{ fontSize: '9px', color: 'var(--text2)', fontFamily: 'monospace' }}>₹{leg.entryPremium.toFixed(1)}</span>
+      <span style={{ fontSize: '9px', color: isOpen ? 'var(--text1)' : 'var(--text3)', fontFamily: 'monospace' }}>{isOpen ? `₹${leg.currentPremium.toFixed(1)}` : `₹${(leg.exitPremium ?? leg.currentPremium).toFixed(1)}`}</span>
+      <span style={{ fontSize: '9px', fontWeight: 600, color: pnlPct >= 0 ? 'var(--bull)' : 'var(--bear)', fontFamily: 'monospace' }}>{pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(1)}%</span>
+      <span style={{ fontSize: '8px', color: isOpen ? '#4ecdc4' : 'var(--text3)', fontFamily: 'monospace' }}>{isOpen ? '●' : leg.exitReason?.slice(0, 6) ?? 'DONE'}</span>
+    </div>
+  )
+}
+
+function HeroPanel({ hero, role, onArm, onDisarm, onReset }: {
+  hero: HeroStateLocal
+  role: string
+  onArm: () => void
+  onDisarm: () => void
+  onReset: () => void
+}) {
+  const pos = hero.position
+  const stats = hero.stats
+  const winRate = stats.trades > 0 ? Math.round(stats.wins / stats.trades * 100) : 0
+  const tierColor = pos?.momTier === 'TIGHT' ? '#ff6b6b' : pos?.momTier === 'MID' ? '#ffd93d' : '#4ecdc4'
+  const dirColor = pos?.direction === 'BULL' ? 'var(--bull)' : 'var(--bear)'
+  const openLegs = pos?.legs.filter(l => l.status === 'OPEN') ?? []
+  const heldMin = pos ? Math.round((Date.now() - pos.entryTs) / 60000) : 0
+  const recentLog = [...hero.log].reverse().slice(0, 6)
+
+  return (
+    <div style={{ background: 'var(--bg2)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '12px 14px', fontFamily: 'monospace' }}>
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '10px', fontWeight: 700, letterSpacing: '0.12em', color: hero.armed ? '#4ecdc4' : 'var(--text3)' }}>
+            //SYSLOG/OPTION/HERO
+          </span>
+          <span style={{ fontSize: '8px', padding: '1px 6px', borderRadius: '3px', background: hero.armed ? 'rgba(78,205,196,0.15)' : 'rgba(255,255,255,0.06)', color: hero.armed ? '#4ecdc4' : 'var(--text3)', border: `1px solid ${hero.armed ? 'rgba(78,205,196,0.3)' : 'rgba(255,255,255,0.1)'}` }}>
+            {hero.armed ? 'ARMED' : 'DISARMED'}
+          </span>
+          {pos && (
+            <span style={{ fontSize: '8px', color: tierColor, padding: '1px 5px', border: `1px solid ${tierColor}60`, borderRadius: '3px' }}>
+              {pos.momTier} TIER
+            </span>
+          )}
+        </div>
+        {role !== 'viewer' && (
+          <div style={{ display: 'flex', gap: '4px' }}>
+            <button onClick={onReset} style={{ fontSize: '8px', padding: '2px 6px', borderRadius: '3px', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', color: 'var(--text3)', cursor: 'pointer' }}>RESET</button>
+            {hero.armed
+              ? <button onClick={onDisarm} style={{ fontSize: '8px', padding: '2px 8px', borderRadius: '3px', background: 'rgba(255,107,107,0.15)', border: '1px solid rgba(255,107,107,0.3)', color: '#ff6b6b', cursor: 'pointer' }}>DISARM</button>
+              : <button onClick={onArm} style={{ fontSize: '8px', padding: '2px 8px', borderRadius: '3px', background: 'rgba(78,205,196,0.15)', border: '1px solid rgba(78,205,196,0.3)', color: '#4ecdc4', cursor: 'pointer' }}>ARM</button>
+            }
+          </div>
+        )}
+      </div>
+
+      {/* Stats row */}
+      <div style={{ display: 'flex', gap: '16px', marginBottom: '10px', padding: '6px 8px', background: 'rgba(255,255,255,0.03)', borderRadius: '4px' }}>
+        <span style={{ fontSize: '9px', color: 'var(--text3)' }}>trades <span style={{ color: 'var(--text1)' }}>{stats.trades}</span></span>
+        <span style={{ fontSize: '9px', color: 'var(--text3)' }}>win% <span style={{ color: winRate >= 50 ? 'var(--bull)' : 'var(--bear)' }}>{winRate}%</span></span>
+        <span style={{ fontSize: '9px', color: 'var(--text3)' }}>P&amp;L <span style={{ color: stats.pnl >= 0 ? 'var(--bull)' : 'var(--bear)', fontWeight: 600 }}>₹{stats.pnl >= 0 ? '+' : ''}{Math.round(stats.pnl)}</span></span>
+        <span style={{ fontSize: '9px', color: 'var(--text3)' }}>closed <span style={{ color: 'var(--text2)' }}>{hero.closedPositions.length}</span></span>
+      </div>
+
+      {/* Active position */}
+      {pos ? (
+        <div style={{ marginBottom: '10px' }}>
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' }}>
+            <span style={{ fontSize: '9px', fontWeight: 700, color: dirColor }}>{pos.direction}</span>
+            <span style={{ fontSize: '9px', color: 'var(--text3)' }}>entry ₹{pos.entrySpot.toFixed(0)}</span>
+            <span style={{ fontSize: '9px', color: 'var(--text3)' }}>held {heldMin}m</span>
+            <span style={{ fontSize: '9px', color: 'var(--text3)' }}>GT {pos.gtScoreAtEntry.toFixed(1)}</span>
+            <span style={{ fontSize: '9px', color: 'var(--text3)' }}>phase {pos.phaseAtEntry}</span>
+            <span style={{ fontSize: '9px', color: pos.totalPnl >= 0 ? 'var(--bull)' : 'var(--bear)', fontWeight: 600, marginLeft: 'auto' }}>₹{pos.totalPnl >= 0 ? '+' : ''}{Math.round(pos.totalPnl)}</span>
+          </div>
+          <div style={{ display: 'flex', gap: '4px', marginBottom: '6px' }}>
+            {['NEAR','MID','FAR'].map(label => {
+              const leg = pos.legs.find(l => l.label === label)
+              if (!leg) return null
+              const lColor = label === 'NEAR' ? '#4ecdc4' : label === 'MID' ? '#ffd93d' : '#ff6b6b'
+              return (
+                <span key={label} style={{ fontSize: '8px', padding: '1px 4px', borderRadius: '3px', background: leg.status === 'OPEN' ? `${lColor}15` : 'rgba(255,255,255,0.04)', color: leg.status === 'OPEN' ? lColor : 'var(--text3)', border: `1px solid ${leg.status === 'OPEN' ? lColor + '40' : 'rgba(255,255,255,0.06)'}` }}>
+                  {leg.status === 'OPEN' ? '●' : '✗'} {label}
+                </span>
+              )
+            })}
+            <span style={{ fontSize: '8px', color: 'var(--text3)', marginLeft: 'auto' }}>{openLegs.length}/3 open</span>
+          </div>
+          {pos.legs.map(leg => <HeroLegRow key={leg.label} leg={leg} />)}
+        </div>
+      ) : (
+        <div style={{ padding: '10px 0', fontSize: '9px', color: 'var(--text3)', textAlign: 'center', letterSpacing: '0.1em' }}>
+          {hero.armed ? '// watching for setup' : '// disarmed — arm to enable auto-entry'}
+        </div>
+      )}
+
+      {/* Recent closed */}
+      {hero.closedPositions.length > 0 && (
+        <div style={{ marginBottom: '8px' }}>
+          <div style={{ fontSize: '8px', color: 'var(--text3)', letterSpacing: '0.08em', marginBottom: '4px' }}>RECENT CLOSED</div>
+          {hero.closedPositions.slice(-3).reverse().map(cp => {
+            const winLoss = cp.totalPnl >= 0
+            return (
+              <div key={cp.id} style={{ display: 'flex', gap: '8px', fontSize: '8px', padding: '2px 0', color: 'var(--text3)' }}>
+                <span style={{ color: cp.direction === 'BULL' ? 'var(--bull)' : 'var(--bear)' }}>{cp.direction}</span>
+                <span>{new Date(cp.entryTs).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' })}</span>
+                <span style={{ color: winLoss ? 'var(--bull)' : 'var(--bear)', fontWeight: 600 }}>₹{cp.totalPnl >= 0 ? '+' : ''}{Math.round(cp.totalPnl)}</span>
+                <span style={{ marginLeft: 'auto' }}>{cp.legs.filter(l => l.status === 'EXITED').map(l => l.exitReason?.slice(0, 4)).join(' ')}</span>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* Log */}
+      {recentLog.length > 0 && (
+        <div style={{ borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '8px' }}>
+          <div style={{ fontSize: '8px', color: 'var(--text3)', letterSpacing: '0.08em', marginBottom: '4px' }}>LOG</div>
+          {recentLog.map((entry, i) => {
+            const actColor = entry.act === 'ENTRY' ? 'var(--bull)' : entry.act === 'EXIT_ALL' || entry.act === 'EXIT_LEG' ? '#ff6b6b' : entry.act === 'ERR' ? '#ff6b6b' : entry.act === 'TIER_CHANGE' ? '#ffd93d' : 'var(--text3)'
+            const t = new Date(entry.ts).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Kolkata' })
+            return (
+              <div key={i} style={{ display: 'flex', gap: '6px', fontSize: '8px', padding: '1px 0', color: 'var(--text3)', fontFamily: 'monospace' }}>
+                <span style={{ color: 'var(--text3)', opacity: 0.5, flexShrink: 0 }}>{t}</span>
+                <span style={{ color: actColor, fontWeight: 600, flexShrink: 0 }}>{entry.act}</span>
+                <span style={{ color: 'var(--text2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.msg}</span>
+                {entry.pnl != null && <span style={{ color: entry.pnl >= 0 ? 'var(--bull)' : 'var(--bear)', marginLeft: 'auto', flexShrink: 0 }}>₹{entry.pnl >= 0 ? '+' : ''}{Math.round(entry.pnl)}</span>}
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 export default function ConvictionClient({ role = 'admin' }: { role?: string }) {
@@ -3968,6 +4165,17 @@ export default function ConvictionClient({ role = 'admin' }: { role?: string }) 
       })
       const data = await res.json()
       if (data.mode) setN50(prev => prev ? { ...prev, autoTrader: data } : prev)
+    } catch {}
+  }, [])
+
+  const handleHeroAction = useCallback(async (action: 'ARM' | 'DISARM' | 'RESET') => {
+    try {
+      const res = await fetch('/api/nifty50/hero', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      })
+      const data = await res.json()
+      if (data && !data.error) setN50(prev => prev ? { ...prev, hero: data } : prev)
     } catch {}
   }, [])
 
@@ -4218,6 +4426,19 @@ export default function ConvictionClient({ role = 'admin' }: { role?: string }) 
                     onArm={role !== 'viewer' ? () => handleATAction('ARM') : () => {}}
                     onDisarm={role !== 'viewer' ? () => handleATAction('DISARM') : () => {}}
                     restricted={role === 'viewer'}
+                  />
+                ) : null,
+              },
+              {
+                id: 'hero',
+                visible: !!n50?.hero,
+                node: n50?.hero ? (
+                  <HeroPanel
+                    hero={n50.hero}
+                    role={role}
+                    onArm={() => handleHeroAction('ARM')}
+                    onDisarm={() => handleHeroAction('DISARM')}
+                    onReset={() => handleHeroAction('RESET')}
                   />
                 ) : null,
               },

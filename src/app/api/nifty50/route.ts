@@ -4,13 +4,15 @@ import { getN50State, updateSysLog, type N50State } from '@/lib/nifty50'
 import { kiteGetLTP } from '@/lib/kite'
 import { getNiftyContracts, getCachedNiftyOI, type NiftyContracts, type NiftyOIAnalytics } from '@/lib/niftyContracts'
 import { processATTick, getATState, ensureATBackground } from '@/lib/autoTrader'
+import { processHeroTick, getHeroState, ensureHeroBackground, type HeroState } from '@/lib/optionHero'
 
 ensureATBackground()
+ensureHeroBackground()
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 
-let cache: { data: N50State & { niftySpot?: number; contracts?: NiftyContracts; sysLog?: any[]; autoTrader?: any; oiAnalytics?: NiftyOIAnalytics }; ts: number } | null = null
+let cache: { data: N50State & { niftySpot?: number; contracts?: NiftyContracts; sysLog?: any[]; autoTrader?: any; hero?: HeroState; oiAnalytics?: NiftyOIAnalytics }; ts: number } | null = null
 const CACHE_TTL = 5_000
 
 async function fetchNiftySpot(): Promise<number | undefined> {
@@ -42,10 +44,16 @@ export async function GET() {
       await processATTick(sysLog, contracts ?? null).catch(() => {})
     }
     const autoTrader = getATState()
-    const result: N50State & { niftySpot?: number; contracts?: NiftyContracts; sysLog?: any[]; autoTrader?: any; oiAnalytics?: NiftyOIAnalytics } = { ...state, niftySpot, contracts: contracts ?? undefined, sysLog, autoTrader }
 
-    // OI analytics: inject from synchronous cache first (always fast), then refresh in background
+    // OI analytics: synchronous cache (always fast)
     const cachedOI = getCachedNiftyOI()
+
+    // Hero processes fire-and-forget with current cached OI
+    if (niftySpot && niftySpot > 0) {
+      processHeroTick(state, niftySpot, cachedOI ?? null).catch(() => {})
+    }
+    const hero = getHeroState()
+    const result: N50State & { niftySpot?: number; contracts?: NiftyContracts; sysLog?: any[]; autoTrader?: any; hero?: HeroState; oiAnalytics?: NiftyOIAnalytics } = { ...state, niftySpot, contracts: contracts ?? undefined, sysLog, autoTrader, hero }
     if (cachedOI) result.oiAnalytics = cachedOI
     if (contracts) {
       const { fetchNiftyChainOI } = await import('@/lib/niftyContracts')
