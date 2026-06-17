@@ -1240,9 +1240,12 @@ function N50GTExplanationModal({ gt, n50, onClose }: { gt: N50GTAnalysis; n50: N
   )
 }
 
+type GTSnapshot = { ts: number; direction: 'BULL' | 'BEAR' | 'NEUTRAL'; spot: number; gtScore: number }
+
 function N50GTPanel({ n50 }: { n50: N50State }) {
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null)
   const [showModal, setShowModal] = useState(false)
+  const gtHistory = useRef<GTSnapshot[]>([])
 
   useEffect(() => {
     const close = () => setCtxMenu(null)
@@ -1264,6 +1267,56 @@ function N50GTPanel({ n50 }: { n50: N50State }) {
   const regimeColor = ['MARKUP', 'ACCUMULATION'].includes(gt.regime) ? 'var(--bull)' :
     ['MARKDOWN', 'DISTRIBUTION'].includes(gt.regime) ? 'var(--bear)' :
     gt.regime === 'CHOP' ? 'var(--text3)' : 'rgba(255,255,255,0.25)'
+
+  // ── Rolling GT price-confirmation tracking ────────────────────────────────
+  // Accumulate snapshots ~every 5s (guarded by 3s min gap to avoid re-render dupes)
+  if (spot > 0) {
+    const hist = gtHistory.current
+    const now = Date.now()
+    if (hist.length === 0 || now - hist[hist.length - 1].ts > 3_000) {
+      hist.push({ ts: now, direction: gt.gtDirection, spot, gtScore: gt.gtScore })
+      if (hist.length > 120) gtHistory.current = hist.slice(-120)  // keep last 10 min
+    }
+  }
+
+  // Find start of current direction streak (walk back while direction matches)
+  const hist = gtHistory.current
+  const currentDir = gt.gtDirection
+  let streakStart = hist.length - 1
+  while (streakStart > 0 && hist[streakStart - 1].direction === currentDir) streakStart--
+  const streakSnap = hist[streakStart]
+  const streakLen = hist.length - streakStart
+  const callTs = streakSnap?.ts ?? 0
+  const callSpot = streakSnap?.spot ?? 0
+  const heldMs = callTs > 0 ? Date.now() - callTs : 0
+  const heldMin = Math.floor(heldMs / 60_000)
+  const heldSec = Math.floor((heldMs % 60_000) / 1_000)
+  const priceDelta = spot > 0 && callSpot > 0 ? (spot - callSpot) / callSpot * 100 : null
+  const priceConfirming = priceDelta != null && (
+    (currentDir === 'BULL' && priceDelta > 0.02) ||
+    (currentDir === 'BEAR' && priceDelta < -0.02)
+  )
+  const priceDiverging = priceDelta != null && (
+    (currentDir === 'BULL' && priceDelta < -0.02) ||
+    (currentDir === 'BEAR' && priceDelta > 0.02)
+  )
+  // Score consistency over streak: fraction of streak samples on correct sign
+  const streakSamples = hist.slice(streakStart)
+  const scoreCorrect = streakSamples.filter(s =>
+    (currentDir === 'BULL' && s.gtScore > 0) ||
+    (currentDir === 'BEAR' && s.gtScore < 0)
+  ).length
+  const scoreConsistency = streakSamples.length > 0 ? scoreCorrect / streakSamples.length : 0
+  // Recent momentum: last 6 snapshots (30s) — is score trending up or down?
+  const recentSamples = hist.slice(-6)
+  let scoreTrend: 'STRENGTHENING' | 'WEAKENING' | 'STABLE' = 'STABLE'
+  if (recentSamples.length >= 4) {
+    const half = Math.floor(recentSamples.length / 2)
+    const early = recentSamples.slice(0, half).reduce((a, s) => a + Math.abs(s.gtScore), 0) / half
+    const late  = recentSamples.slice(-half).reduce((a, s) => a + Math.abs(s.gtScore), 0) / half
+    if (late - early > 0.04) scoreTrend = 'STRENGTHENING'
+    else if (early - late > 0.04) scoreTrend = 'WEAKENING'
+  }
 
   const noOI = !n50.oiAnalytics
   const scoreBarW = 140
@@ -1410,6 +1463,81 @@ function N50GTPanel({ n50 }: { n50: N50State }) {
           })()}
         </div>
 
+        {/* ── Price Confirmation ─────────────────────────────────── */}
+        {streakLen >= 2 && currentDir !== 'NEUTRAL' && callSpot > 0 && (
+          <div style={{
+            borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '6px',
+            display: 'flex', flexDirection: 'column', gap: '3px',
+          }}>
+            {/* Confirmation header row */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '8px', fontWeight: 700, color: CYB.glow, letterSpacing: '0.1em' }}>PRICE CONFIRM</span>
+              {priceDelta != null && (
+                <>
+                  <span style={{ fontSize: '9px', color: 'var(--text3)' }}>
+                    ₹{callSpot.toFixed(0)} → ₹{spot.toFixed(0)}
+                  </span>
+                  <span style={{
+                    fontSize: '11px', fontWeight: 900,
+                    color: priceConfirming ? '#34d399' : priceDiverging ? '#f87171' : 'var(--text3)',
+                  }}>
+                    {priceDelta >= 0 ? '+' : ''}{priceDelta.toFixed(2)}%
+                  </span>
+                  <span style={{
+                    fontSize: '9px', fontWeight: 700,
+                    color: priceConfirming ? '#34d399' : priceDiverging ? '#f87171' : 'var(--text3)',
+                  }}>
+                    {priceConfirming ? '✓ confirming' : priceDiverging ? '✗ diverging' : '~ flat'}
+                  </span>
+                </>
+              )}
+            </div>
+            {/* Streak stats row */}
+            <div style={{ display: 'flex', gap: '10px', fontSize: '8px', color: 'var(--text3)', flexWrap: 'wrap' }}>
+              <span>
+                held{' '}
+                <span style={{ color: 'var(--text2)', fontWeight: 600 }}>
+                  {heldMin > 0 ? `${heldMin}m ${heldSec}s` : `${heldSec}s`}
+                </span>
+                {' '}({streakLen} polls)
+              </span>
+              <span>
+                score consistency{' '}
+                <span style={{
+                  fontWeight: 700,
+                  color: scoreConsistency >= 0.8 ? '#34d399' : scoreConsistency >= 0.5 ? '#fbbf24' : '#f87171',
+                }}>
+                  {(scoreConsistency * 100).toFixed(0)}%
+                </span>
+              </span>
+              {scoreTrend !== 'STABLE' && (
+                <span style={{
+                  fontWeight: 700,
+                  color: scoreTrend === 'STRENGTHENING' ? '#34d399' : '#f87171',
+                }}>
+                  {scoreTrend === 'STRENGTHENING' ? '↑ strengthening' : '↓ weakening'}
+                </span>
+              )}
+            </div>
+            {/* Mini sparkline — last 12 score values as bars */}
+            {hist.length >= 3 && (() => {
+              const bars = hist.slice(-12)
+              return (
+                <div style={{ display: 'flex', alignItems: 'flex-end', gap: '2px', height: '14px' }}>
+                  {bars.map((s, i) => {
+                    const h = Math.max(2, Math.abs(s.gtScore) * 14)
+                    const c = s.direction === 'BULL' ? 'var(--bull)' : s.direction === 'BEAR' ? 'var(--bear)' : 'rgba(255,255,255,0.15)'
+                    const isLast = i === bars.length - 1
+                    return (
+                      <div key={i} style={{ flex: 1, height: `${h}px`, background: c, borderRadius: '1px', opacity: isLast ? 1 : 0.4 + (i / bars.length) * 0.5 }} />
+                    )
+                  })}
+                </div>
+              )
+            })()}
+          </div>
+        )}
+
         {/* ── Entry Verdict ──────────────────────────────────────── */}
         <div style={{
           borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '6px',
@@ -1417,6 +1545,10 @@ function N50GTPanel({ n50 }: { n50: N50State }) {
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
             <span style={{ fontSize: '9px', fontWeight: 900, color: setupColor, letterSpacing: '0.05em' }}>{verdictText}</span>
+            {/* Confirmation modifier on verdict */}
+            {priceDiverging && streakLen >= 4 && (
+              <span style={{ fontSize: '8px', color: '#f87171', fontWeight: 700 }}>⚠ price not following</span>
+            )}
           </div>
           {/* Target line */}
           {gt.gtTarget != null && gt.gtDirection !== 'NEUTRAL' && (
