@@ -41,7 +41,10 @@ export const NIFTY50_WEIGHTS: Record<string, number> = {
 }
 
 const HEAVYWEIGHT_THRESHOLD = 2.0
+const MIDWEIGHT_THRESHOLD   = 0.8   // 0.8% ≤ weight < 2.0% = MID; < 0.8% = LOW
 export const NIFTY50_HEAVYWEIGHTS = NIFTY50_STOCKS.filter(s => (NIFTY50_WEIGHTS[s] ?? 0) >= HEAVYWEIGHT_THRESHOLD)
+export const NIFTY50_MIDWEIGHTS   = NIFTY50_STOCKS.filter(s => { const w = NIFTY50_WEIGHTS[s] ?? 0; return w >= MIDWEIGHT_THRESHOLD && w < HEAVYWEIGHT_THRESHOLD })
+export const NIFTY50_LOWWEIGHTS   = NIFTY50_STOCKS.filter(s => (NIFTY50_WEIGHTS[s] ?? 0) < MIDWEIGHT_THRESHOLD)
 
 function getWeight(stock: string): number {
   return NIFTY50_WEIGHTS[stock] ?? (100 / NIFTY50_STOCKS.length)
@@ -156,6 +159,8 @@ export interface N50State {
   sysLog?: SysLogEntry[]
   niftySpot?: number
   heavyweights?: HeavyweightDetail[]
+  midweights?: HeavyweightDetail[]
+  lowweights?: HeavyweightDetail[]
   elliottWave?: ElliottWaveState | null
   elliottWaveByTF?: Partial<Record<string, ElliottWaveState>>
 }
@@ -1328,23 +1333,29 @@ export function getN50State(): N50State {
   const technicals = computeTechAggregates(stocks)
   const composite = computeComposite(prediction, technicals)
 
-  const hwDetail: HeavyweightDetail[] = []
-  for (const name of NIFTY50_HEAVYWEIGHTS) {
-    const s = stocks[name]
-    if (!s || s.ltp <= 0) continue
-    hwDetail.push({
-      name,
-      weight: NIFTY50_WEIGHTS[name] ?? 0,
-      ltp: s.ltp,
-      trend: s.trend ?? 'NEUTRAL',
-      cdZ: s.cdZ ?? 0,
-      signal: s.signal ?? 'NEUTRAL',
-      vwap: s.indicators?.vwapAlign ?? 'NEUTRAL',
-      pat30v2Bull: s.pat30v2?.bull ?? 50,
-      pat30v2Bear: s.pat30v2?.bear ?? 50,
-    })
+  function buildWeightDetail(names: readonly string[]): HeavyweightDetail[] {
+    const out: HeavyweightDetail[] = []
+    for (const name of names) {
+      const s = stocks[name]
+      if (!s || s.ltp <= 0) continue
+      out.push({
+        name,
+        weight: NIFTY50_WEIGHTS[name] ?? 0,
+        ltp: s.ltp,
+        trend: s.trend ?? 'NEUTRAL',
+        cdZ: s.cdZ ?? 0,
+        signal: s.signal ?? 'NEUTRAL',
+        vwap: s.indicators?.vwapAlign ?? 'NEUTRAL',
+        pat30v2Bull: s.pat30v2?.bull ?? 50,
+        pat30v2Bear: s.pat30v2?.bear ?? 50,
+      })
+    }
+    return out.sort((a, b) => b.weight - a.weight)
   }
-  hwDetail.sort((a, b) => b.weight - a.weight)
+
+  const hwDetail  = buildWeightDetail(NIFTY50_HEAVYWEIGHTS)
+  const midDetail = buildWeightDetail(NIFTY50_MIDWEIGHTS)
+  const lowDetail = buildWeightDetail(NIFTY50_LOWWEIGHTS)
 
   // EW refresh — fire-and-forget, timestamps stamped before firing
   const tfsToRefresh = Object.keys(NIFTY_EW_TF_CONFIG).filter(
@@ -1388,6 +1399,8 @@ export function getN50State(): N50State {
     minutesAccumulated,
     dayPrediction: getDayPredictionState(),
     heavyweights: hwDetail,
+    midweights: midDetail,
+    lowweights: lowDetail,
     elliottWave,
     elliottWaveByTF,
   }

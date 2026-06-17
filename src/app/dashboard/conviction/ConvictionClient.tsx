@@ -161,6 +161,8 @@ interface N50State {
   sysLog?: SysLogEntry[]
   autoTrader?: ATState
   heavyweights?: { name: string; weight: number; ltp: number; trend: string; cdZ: number; signal: string; vwap: string; pat30v2Bull: number; pat30v2Bear: number }[]
+  midweights?: { name: string; weight: number; ltp: number; trend: string; cdZ: number; signal: string; vwap: string; pat30v2Bull: number; pat30v2Bear: number }[]
+  lowweights?: { name: string; weight: number; ltp: number; trend: string; cdZ: number; signal: string; vwap: string; pat30v2Bull: number; pat30v2Bear: number }[]
   oiAnalytics?: {
     strikes: Array<{
       strike: number; ceSymbol: string; peSymbol: string
@@ -2136,60 +2138,71 @@ function N50Oracle({ n50, role = 'admin' }: { n50: N50State | null; role?: strin
         </>}
       </div>
 
-      {/* Heavyweights indicator */}
-      {n50.heavyweights && n50.heavyweights.length > 0 && (() => {
-        const hw = n50.heavyweights!
-        const hwBullW = hw.filter(h => h.trend === 'BULL').reduce((s, h) => s + h.weight, 0)
-        const hwBearW = hw.filter(h => h.trend === 'BEAR').reduce((s, h) => s + h.weight, 0)
-        const hwTotalW = hw.reduce((s, h) => s + h.weight, 0)
-        const hwBullPct = hwTotalW > 0 ? Math.round((hwBullW / hwTotalW) * 100) : 0
-        const hwBearPct = hwTotalW > 0 ? Math.round((hwBearW / hwTotalW) * 100) : 0
-        const hwDir = hwBullPct > hwBearPct + 20 ? 'BULL' : hwBearPct > hwBullPct + 20 ? 'BEAR' : null
-        return (
-          <div style={{
-            padding: '6px 8px', borderRadius: '4px',
-            background: 'rgba(0,0,0,0.15)',
-            border: `1px solid ${hwDir === 'BULL' ? 'rgba(34,197,94,0.25)' : hwDir === 'BEAR' ? 'rgba(239,68,68,0.25)' : CYB.glowBorder}`,
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
-              <span style={{ fontSize: '8px', color: CYB.glow, letterSpacing: '0.1em', fontWeight: 700, width: '48px' }}>HEAVY</span>
-              <span style={{ fontSize: '12px', fontWeight: 700, color: hwDir === 'BULL' ? 'var(--bull)' : hwDir === 'BEAR' ? 'var(--bear)' : 'var(--text2)' }}>
-                {hwDir === 'BULL' ? '▲' : hwDir === 'BEAR' ? '▼' : '·'} {hwBullPct}B / {hwBearPct}S
-              </span>
-              <span style={{ fontSize: '10px', color: 'var(--text3)', marginLeft: '4px' }}>
-                · {Math.round(hwTotalW)}% of index
-              </span>
-            </div>
-            <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
-              {hw.map(h => {
-                const dir = h.trend === 'BULL' ? 'bull' : h.trend === 'BEAR' ? 'bear' : 'neut'
-                const patDir = h.pat30v2Bull > 60 ? 'bull' : h.pat30v2Bear > 60 ? 'bear' : 'neut'
-                const color = dir === 'bull' ? 'var(--bull)' : dir === 'bear' ? 'var(--bear)' : 'var(--text3)'
-                return (
-                  <div key={h.name} style={{
-                    padding: '3px 6px', borderRadius: '3px', fontSize: '10px',
-                    background: dir === 'bull' ? 'rgba(34,197,94,0.1)' : dir === 'bear' ? 'rgba(239,68,68,0.1)' : 'rgba(255,255,255,0.03)',
-                    border: `1px solid ${dir === 'bull' ? 'rgba(34,197,94,0.2)' : dir === 'bear' ? 'rgba(239,68,68,0.2)' : 'var(--border)'}`,
-                    display: 'flex', gap: '4px', alignItems: 'center',
-                  }}>
-                    <span style={{ fontWeight: 700, color, fontSize: '10px' }}>{h.name}</span>
-                    <span style={{ color: 'var(--text3)', fontSize: '8px' }}>{h.weight.toFixed(1)}%</span>
-                    <span style={{ color, fontSize: '9px' }}>
-                      {h.trend === 'BULL' ? '▲' : h.trend === 'BEAR' ? '▼' : '·'}
-                    </span>
-                    <span style={{ fontSize: '8px', color: h.cdZ > 0.5 ? 'var(--bull)' : h.cdZ < -0.5 ? 'var(--bear)' : 'var(--text3)' }}>
-                      cd{h.cdZ >= 0 ? '+' : ''}{h.cdZ.toFixed(1)}
-                    </span>
-                    <span style={{
-                      fontSize: '8px', fontWeight: 600,
-                      color: patDir === 'bull' ? 'var(--bull)' : patDir === 'bear' ? 'var(--bear)' : 'var(--text3)',
+      {/* Weight tiers — HEAVY / MID / LOW, all N50 constituents */}
+      {(() => {
+        type WD = { name: string; weight: number; trend: string; cdZ: number; pat30v2Bull: number; pat30v2Bear: number }
+
+        function tierSummary(stocks: WD[]) {
+          const bullW = stocks.filter(h => h.trend === 'BULL').reduce((s, h) => s + h.weight, 0)
+          const bearW = stocks.filter(h => h.trend === 'BEAR').reduce((s, h) => s + h.weight, 0)
+          const totalW = stocks.reduce((s, h) => s + h.weight, 0)
+          const bullPct = totalW > 0 ? Math.round((bullW / totalW) * 100) : 0
+          const bearPct = totalW > 0 ? Math.round((bearW / totalW) * 100) : 0
+          const dir = bullPct > bearPct + 20 ? 'BULL' : bearPct > bullPct + 20 ? 'BEAR' : null
+          return { bullPct, bearPct, dir, totalW }
+        }
+
+        function WeightTierRow({ label, stocks, chipSize }: { label: string; stocks: WD[]; chipSize: number }) {
+          if (!stocks || stocks.length === 0) return null
+          const { bullPct, bearPct, dir, totalW } = tierSummary(stocks)
+          return (
+            <div style={{
+              padding: '5px 7px', borderRadius: '4px',
+              background: 'rgba(0,0,0,0.15)',
+              border: `1px solid ${dir === 'BULL' ? 'rgba(34,197,94,0.25)' : dir === 'BEAR' ? 'rgba(239,68,68,0.25)' : CYB.glowBorder}`,
+              marginBottom: '4px',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                <span style={{ fontSize: '8px', color: CYB.glow, letterSpacing: '0.1em', fontWeight: 700, width: '48px' }}>{label}</span>
+                <span style={{ fontSize: '12px', fontWeight: 700, color: dir === 'BULL' ? 'var(--bull)' : dir === 'BEAR' ? 'var(--bear)' : 'var(--text2)' }}>
+                  {dir === 'BULL' ? '▲' : dir === 'BEAR' ? '▼' : '·'} {bullPct}B / {bearPct}S
+                </span>
+                <span style={{ fontSize: '9px', color: 'var(--text3)' }}>· {Math.round(totalW)}% of index</span>
+              </div>
+              <div style={{ display: 'flex', gap: '3px', flexWrap: 'wrap' }}>
+                {stocks.map(h => {
+                  const dir2 = h.trend === 'BULL' ? 'bull' : h.trend === 'BEAR' ? 'bear' : 'neut'
+                  const patDir = h.pat30v2Bull > 60 ? 'bull' : h.pat30v2Bear > 60 ? 'bear' : 'neut'
+                  const color = dir2 === 'bull' ? 'var(--bull)' : dir2 === 'bear' ? 'var(--bear)' : 'var(--text3)'
+                  return (
+                    <div key={h.name} style={{
+                      padding: `2px ${chipSize >= 10 ? 5 : 4}px`, borderRadius: '3px',
+                      background: dir2 === 'bull' ? 'rgba(34,197,94,0.09)' : dir2 === 'bear' ? 'rgba(239,68,68,0.09)' : 'rgba(255,255,255,0.03)',
+                      border: `1px solid ${dir2 === 'bull' ? 'rgba(34,197,94,0.18)' : dir2 === 'bear' ? 'rgba(239,68,68,0.18)' : 'var(--border)'}`,
+                      display: 'flex', gap: '3px', alignItems: 'center',
                     }}>
-                      {h.pat30v2Bull}/{h.pat30v2Bear}
-                    </span>
-                  </div>
-                )
-              })}
+                      <span style={{ fontWeight: 700, color, fontSize: `${chipSize}px` }}>{h.name}</span>
+                      <span style={{ color: 'var(--text3)', fontSize: '8px' }}>{h.weight.toFixed(1)}%</span>
+                      <span style={{ color, fontSize: '9px' }}>{h.trend === 'BULL' ? '▲' : h.trend === 'BEAR' ? '▼' : '·'}</span>
+                      <span style={{ fontSize: '8px', color: h.cdZ > 0.5 ? 'var(--bull)' : h.cdZ < -0.5 ? 'var(--bear)' : 'var(--text3)' }}>
+                        cd{h.cdZ >= 0 ? '+' : ''}{h.cdZ.toFixed(1)}
+                      </span>
+                      <span style={{ fontSize: '8px', fontWeight: 600, color: patDir === 'bull' ? 'var(--bull)' : patDir === 'bear' ? 'var(--bear)' : 'var(--text3)' }}>
+                        {h.pat30v2Bull}/{h.pat30v2Bear}
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
             </div>
+          )
+        }
+
+        return (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0px' }}>
+            <WeightTierRow label="HEAVY" stocks={n50.heavyweights ?? []} chipSize={10} />
+            <WeightTierRow label="MID" stocks={n50.midweights ?? []} chipSize={9} />
+            <WeightTierRow label="LOW" stocks={n50.lowweights ?? []} chipSize={9} />
           </div>
         )
       })()}
