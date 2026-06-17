@@ -3644,8 +3644,9 @@ export default function ConvictionClient({ role = 'admin' }: { role?: string }) 
   const [capital, setCapital] = useState<CapitalData | null>(null)
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
   const [status, setStatus] = useState<'connecting' | 'live' | 'stale'>('connecting')
-  const [filter, setFilter] = useState<'all' | 'strong' | 'partial' | 'positions' | 'nifty50'>('all')
+  const [filter, setFilter] = useState<'all' | 'strong' | 'partial' | 'positions' | 'nifty50'>('nifty50')
   const [n50, setN50] = useState<N50State | null>(null)
+  const [n50Fut, setN50Fut] = useState<any | null>(null)
   const [orderState, setOrderState] = useState<OrderState>({ confirm: null, status: null, ordering: false })
   const [showTgSettings, setShowTgSettings] = useState(false)
   const esRef = useRef<EventSource | null>(null)
@@ -3653,7 +3654,7 @@ export default function ConvictionClient({ role = 'admin' }: { role?: string }) 
   // AT state comes from server via n50.autoTrader — no client state needed
   const at: ATState = n50?.autoTrader ?? AT_DEFAULT
 
-  // Poll N50 predictions when in nifty50 mode
+  // Poll N50 + N50 Futures when in nifty50 mode
   useEffect(() => {
     if (filter !== 'nifty50') return
     let cancelled = false
@@ -3664,13 +3665,20 @@ export default function ConvictionClient({ role = 'admin' }: { role?: string }) 
       }).then(data => {
         if (!cancelled && data && !data.error) setN50(data)
       }).catch(() => {})
+      fetch('/api/niftyfut').then(r => {
+        if (!r.ok) return
+        return r.json()
+      }).then(data => {
+        if (!cancelled && data && !data.error) setN50Fut(data)
+      }).catch(() => {})
     }
     poll()
-    const iv = setInterval(poll, 10_000)
+    const iv = setInterval(poll, 6_000)
     return () => {
       cancelled = true
       clearInterval(iv)
       setN50(null)
+      setN50Fut(null)
       setOrderState(s => s.ordering ? s : { confirm: null, status: s.status, ordering: false })
     }
   }, [filter])
@@ -3752,7 +3760,7 @@ export default function ConvictionClient({ role = 'admin' }: { role?: string }) 
           <span style={{ fontSize: '11px', color: 'var(--accent)', letterSpacing: '0.05em', fontWeight: 700 }}>CONVICTION</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
-          {[{ href: '/dashboard', label: '📊' }, { href: '/dashboard/backtest', label: 'BT' }, { href: '/dashboard/conviction-n50fut', label: 'N50 FUT ▶' }, { href: '/dashboard/conviction-crude', label: 'CRUDE ▶' }, { href: '/dashboard/live', label: '◉' }].map(l => (
+          {[{ href: '/dashboard', label: '📊' }, { href: '/dashboard/backtest', label: 'BT' }, { href: '/dashboard/conviction-crude', label: 'CRUDE ▶' }, { href: '/dashboard/live', label: '◉' }].map(l => (
             <a key={l.href} href={l.href} style={{ ...btnStyle, padding: '3px 6px', fontSize: '10px' }}>{l.label}</a>
           ))}
           <button onClick={() => setShowTgSettings(true)} style={{ ...btnStyle, cursor: 'pointer', padding: '3px 6px', fontSize: '10px' }} title="Telegram">TG</button>
@@ -3794,7 +3802,7 @@ export default function ConvictionClient({ role = 'admin' }: { role?: string }) 
         </div>
       </div>
 
-      {/* N50 draggable panels — Oracle/GT, SysLog, Chain+EW, Contracts, Positions */}
+      {/* N50 draggable panels — N50Fut, Oracle/GT, SysLog, Chain+EW, Contracts */}
       {filter === 'nifty50' && (
         <div style={{ padding: '8px 10px 0' }}>
           <DraggablePanelLayout
@@ -3802,6 +3810,117 @@ export default function ConvictionClient({ role = 'admin' }: { role?: string }) 
             isAdmin={role === 'admin'}
             gap={8}
             panels={([
+              {
+                id: 'n50fut',
+                visible: true,
+                node: (() => {
+                  const f = n50Fut
+                  const S2 = { bull: 'var(--bull)', bear: 'var(--bear)', text2: 'var(--text2)', text3: 'var(--text3)', border: 'var(--border)' }
+                  const dc = (d: string | null) => d === 'BULL' ? S2.bull : d === 'BEAR' ? S2.bear : S2.text2
+                  const fp = (v: number, d = 2) => `${v >= 0 ? '+' : ''}${v.toFixed(d)}%`
+                  const panel: React.CSSProperties = { background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: '6px', padding: '10px 12px' }
+                  const lbl: React.CSSProperties = { fontSize: '9px', color: S2.text2, letterSpacing: '1px', textTransform: 'uppercase' as const, marginBottom: '6px' }
+
+                  if (!f) return (
+                    <div style={panel}>
+                      <div style={lbl}>NIFTY FUTURES</div>
+                      <div style={{ fontSize: '10px', color: S2.text3 }}>Loading futures data…</div>
+                    </div>
+                  )
+
+                  const comp = f.composite ?? {}
+                  const v2 = f.v2 ?? null
+                  const pa = f.phaseAnalysis ?? null
+                  const ots = f.otsState ?? null
+                  const flow = v2?.flowState ?? null
+                  const spot = f.spot ?? 0
+                  const dir: string | null = comp.direction ?? null
+                  const cdZ: number | null = flow?.cdZScore ?? null
+                  const cusum: string | null = flow?.cusumAlarm ?? null
+                  const v2Dir: string | null = v2?.prediction?.direction ?? null
+                  const v2Bull: number = v2?.prediction?.bullProb ?? 0.5
+                  const otsAction: string = ots?.decision?.action ?? 'WAIT'
+                  const otsPos = ots?.position ?? null
+                  const borderColor = dir === 'BULL' ? 'rgba(34,197,94,0.35)' : dir === 'BEAR' ? 'rgba(239,68,68,0.35)' : 'var(--border)'
+
+                  return (
+                    <div style={{ ...panel, border: `1px solid ${borderColor}` }}>
+                      {/* Header row */}
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                        <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px' }}>
+                          <span style={{ fontSize: '9px', color: 'var(--text2)', letterSpacing: '1px', textTransform: 'uppercase' }}>NIFTY FUTURES</span>
+                          <span style={{ fontSize: '13px', fontWeight: 700, color: dc(dir) }}>{dir ?? '—'}</span>
+                          <span style={{ fontSize: '14px', fontWeight: 900, color: dc(dir) }}>{spot > 0 ? spot.toFixed(0) : '—'}</span>
+                        </div>
+                        <div style={{ display: 'flex', gap: '6px', alignItems: 'center', fontSize: '10px' }}>
+                          <span style={{ color: S2.text3 }}>{f.futureSymbol ?? 'NF'}</span>
+                          <span style={{ color: f.marketOpen ? 'var(--bull)' : S2.text3, fontSize: '8px' }}>{f.marketOpen ? '●' : '○'}</span>
+                        </div>
+                      </div>
+
+                      {/* Signal row: oracle + V2 + flow */}
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '6px', fontSize: '10px', marginBottom: '8px' }}>
+                        <div style={{ padding: '4px 6px', background: 'rgba(255,255,255,0.03)', borderRadius: '4px' }}>
+                          <div style={{ fontSize: '8px', color: S2.text3 }}>ORACLE</div>
+                          <div style={{ color: dc(dir), fontWeight: 700 }}>{dir ?? '—'}</div>
+                          <div style={{ color: S2.text2, fontSize: '9px' }}>{fp(comp.predictedMove ?? 0)}</div>
+                        </div>
+                        <div style={{ padding: '4px 6px', background: 'rgba(255,255,255,0.03)', borderRadius: '4px' }}>
+                          <div style={{ fontSize: '8px', color: S2.text3 }}>V2</div>
+                          <div style={{ color: dc(v2Dir), fontWeight: 700 }}>{v2Dir ?? '—'}</div>
+                          <div style={{ color: S2.text2, fontSize: '9px' }}>{v2Bull > 0.5 ? 'B' : 'S'}{Math.round(Math.abs(v2Bull - 0.5) * 200)}%</div>
+                        </div>
+                        <div style={{ padding: '4px 6px', background: 'rgba(255,255,255,0.03)', borderRadius: '4px' }}>
+                          <div style={{ fontSize: '8px', color: S2.text3 }}>CD·Z</div>
+                          <div style={{ color: cdZ != null ? dc(cdZ > 0.5 ? 'BULL' : cdZ < -0.5 ? 'BEAR' : null) : S2.text3, fontWeight: 700 }}>
+                            {cdZ != null ? `${cdZ >= 0 ? '+' : ''}${cdZ.toFixed(2)}σ` : '—'}
+                          </div>
+                          {cusum && <div style={{ color: dc(cusum), fontSize: '9px' }}>⚡{cusum}</div>}
+                        </div>
+                        <div style={{ padding: '4px 6px', background: 'rgba(255,255,255,0.03)', borderRadius: '4px' }}>
+                          <div style={{ fontSize: '8px', color: S2.text3 }}>REGIME</div>
+                          <div style={{ color: S2.text2, fontWeight: 700, fontSize: '9px' }}>{f.metaRegime?.regime ?? '—'}</div>
+                          <div style={{ color: S2.text3, fontSize: '8px' }}>{f.metaRegime ? `${Math.round((f.metaRegime.confidence ?? 0) * 100)}%` : ''}</div>
+                        </div>
+                      </div>
+
+                      {/* Phase row */}
+                      {pa && (
+                        <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', marginBottom: '8px', padding: '5px 7px', background: 'rgba(255,255,255,0.02)', borderRadius: '4px', border: '1px solid var(--border)' }}>
+                          <span style={{ fontSize: '9px', color: S2.text3, width: '36px' }}>PHASE</span>
+                          <span style={{ fontWeight: 700, fontSize: '11px', color: pa.phase === 'START' ? '#eab308' : pa.phase === 'MID' ? 'var(--bull)' : pa.phase === 'END' ? 'var(--bear)' : S2.text3 }}>
+                            {pa.phase}
+                          </span>
+                          <span style={{ fontSize: '9px', color: S2.text2 }}>{Math.round(pa.phaseConfidence * 100)}%</span>
+                          <span style={{ fontSize: '9px', color: pa.stability === 'STABLE' ? 'var(--bull)' : pa.stability === 'NOISY' ? 'var(--bear)' : '#eab308' }}>σ={pa.featureMaxStd?.toFixed(2) ?? '—'}</span>
+                          <span style={{ fontSize: '9px', color: pa.cdVelRoCLabel === 'ACCELERATING' ? 'var(--bull)' : pa.cdVelRoCLabel === 'DECELERATING' ? 'var(--bear)' : S2.text2 }}>{pa.cdVelRoCLabel ?? pa.cdVelTrend}</span>
+                          <span style={{ fontSize: '9px', color: pa.obiCdAlignment === 'HIDDEN' ? '#eab308' : pa.obiCdAlignment === 'VISIBLE' ? 'var(--bull)' : S2.text2 }}>r={(pa.obiCdCorr ?? 0) >= 0 ? '+' : ''}{(pa.obiCdCorr ?? 0).toFixed(2)}</span>
+                          <span style={{ fontSize: '9px', color: pa.knnConsistency === 'ALIGNED' ? 'var(--bull)' : pa.knnConsistency === 'MIXED' ? '#eab308' : S2.text3 }}>{pa.knnConsistencyDetail ?? pa.knnConsistency}</span>
+                        </div>
+                      )}
+
+                      {/* OPT TRADE SYS row */}
+                      {ots && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', padding: '5px 7px', background: otsAction === 'ENTER' ? 'rgba(34,197,94,0.06)' : otsAction === 'EXIT_STOP' ? 'rgba(239,68,68,0.06)' : 'rgba(255,255,255,0.02)', borderRadius: '4px', border: `1px solid ${otsAction === 'ENTER' ? 'rgba(34,197,94,0.25)' : otsAction === 'EXIT_STOP' ? 'rgba(239,68,68,0.25)' : 'var(--border)'}` }}>
+                          <span style={{ fontSize: '9px', color: S2.text3, width: '36px' }}>OTS</span>
+                          <span style={{ fontWeight: 700, fontSize: '10px', color: otsAction === 'ENTER' ? 'var(--bull)' : otsAction.startsWith('EXIT') ? 'var(--bear)' : otsAction === 'TIGHTEN' ? '#eab308' : S2.text2 }}>
+                            {otsAction}
+                          </span>
+                          {otsPos && (
+                            <>
+                              <span style={{ fontSize: '9px', color: dc(otsPos.direction) }}>{otsPos.direction} {otsPos.strike}{otsPos.optType}</span>
+                              <span style={{ fontSize: '9px', color: (otsPos.pnl ?? 0) >= 0 ? 'var(--bull)' : 'var(--bear)' }}>
+                                ₹{(otsPos.pnl ?? 0) >= 0 ? '+' : ''}{Math.round(otsPos.pnl ?? 0)}
+                              </span>
+                            </>
+                          )}
+                          <span style={{ fontSize: '9px', color: S2.text3, marginLeft: 'auto' }}>{ots.decision?.reason?.slice(0, 50)}</span>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })(),
+              },
               {
                 id: 'oracle_gt',
                 visible: true,
