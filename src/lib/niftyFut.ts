@@ -620,11 +620,26 @@ export interface MetaRegimeData {
 export interface PhaseAnalysis {
   phase: 'START' | 'MID' | 'END' | 'UNKNOWN'
   phaseConfidence: number       // 0–1
+
+  // 1. Feature variance stability (per-dimension std across last 5 V2 snapshots)
   stability: 'STABLE' | 'TRANSITIONING' | 'NOISY'
-  stabilityScore: number        // mean cosine similarity of consecutive vectors (0–1)
+  stabilityScore: number        // 0–1: 0 = very noisy, 1 = very stable (inverted max-dim-std)
+  featureMaxStd: number         // raw max per-dimension std (higher = more volatile)
+
+  // 2. cdVelZ rate-of-change (derivative of cdZScore over real flowState samples)
   cdVelTrend: 'RISING' | 'FLAT' | 'FALLING'
-  cdVelSlope: number            // raw OLS slope of cdZ over last 12 snapshots
-  obiCdAlignment: 'HIDDEN' | 'VISIBLE' | 'NEUTRAL'
+  cdVelSlope: number            // OLS slope of V2 vec[0] (cdZ) — snapshot-level
+  cdVelRoC: number              // actual δcdZ/sample from flowState history (faster signal)
+  cdVelRoCLabel: 'ACCELERATING' | 'STEADY' | 'DECELERATING'
+
+  // 3. OBI/CD rolling Pearson correlation (last 20 real (obi, cdZ) sample pairs)
+  obiCdCorr: number             // Pearson r: +1 = visible/aligned, -1 = hidden/diverging
+  obiCdAlignment: 'HIDDEN' | 'VISIBLE' | 'NEUTRAL'  // derived from obiCdCorr
+
+  // 4. kNN prediction consistency (last 3 V2 query results)
+  knnConsistency: 'ALIGNED' | 'MIXED' | 'INSUFFICIENT'
+  knnConsistencyDetail: string  // e.g. "3/3 BULL" or "2/3 BEAR, 1/3 BULL"
+
   regimeDurationMin: number     // minutes current regime has been active
   trendDirection: 'BULL' | 'BEAR' | null
 }
@@ -705,6 +720,10 @@ interface ProductState {
   lastFlowState: NiftyFlowState | null
   lastFlowStateAt: number
   instrumentToken: number
+  // Phase analysis rolling histories
+  cdZHistory: number[]                                          // last 10 cdZScore samples for RoC
+  knnHistory: { direction: 'BULL' | 'BEAR' | null; bullProb: number }[]  // last 3 V2 query results
+  obiCdPairs: { obi: number; cdZ: number }[]                   // last 30 (obi, cdZ) pairs for correlation
 }
 
 // Single product state for NIFTY (no Map needed)
@@ -741,6 +760,9 @@ function getNiftyProductState(): ProductState {
       lastFlowState: null,
       lastFlowStateAt: 0,
       instrumentToken: 0,
+      cdZHistory: [],
+      knnHistory: [],
+      obiCdPairs: [],
     }
   }
   return _niftyProductState
@@ -1012,46 +1034,119 @@ export function computeNiftyMetaRegime(patterns: NiftyPattern[], n = 60): MetaRe
   return { regime, confidence, avgCdZ, avgObi, divergenceScore, momentumSlope }
 }
 
+// ── Phase Analysis helpers ─────────────────────────────────────────────────────
+
+function _pearsonR(xs: number[], ys: number[]): number {
+  const n = Math.min(xs.length, ys.length)
+  if (n < 3) return 0
+  const meanX = xs.slice(0, n).reduce((a, b) => a + b, 0) / n
+  const meanY = ys.slice(0, n).reduce((a, b) => a + b, 0) / n
+  let num = 0, denX = 0, denY = 0
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - meanX, dy = ys[i] - meanY
+    num  += dx * dy
+    denX += dx * dx
+    denY += dy * dy
+  }
+  const denom = Math.sqrt(denX * denY)
+  return denom > 1e-10 ? num / denom : 0
+}
+
 // ── Phase Analysis ────────────────────────────────────────────────────────────
 
 export function computePhaseAnalysis(
   patternsV2: PatternV2[],
   metaRegime: MetaRegimeData | null,
+  cdZHistory: number[],                                              // flowState cdZScore samples
+  knnHistory: { direction: 'BULL' | 'BEAR' | null; bullProb: number }[],  // last 3 V2 queries
+  obiCdPairs: { obi: number; cdZ: number }[],                       // (obi, cdZ) pairs from depth+flow
 ): PhaseAnalysis {
   const trendDirection: 'BULL' | 'BEAR' | null =
     metaRegime?.regime === 'ACCUMULATION' || metaRegime?.regime === 'MARKUP' ? 'BULL' :
     metaRegime?.regime === 'DISTRIBUTION' || metaRegime?.regime === 'MARKDOWN' ? 'BEAR' : null
 
-  // 1. Feature stability — mean cosine similarity between last 6 consecutive V2 vectors
-  const stabilitySlice = patternsV2.slice(-6)
-  let stabilityScore = 0.5
-  if (stabilitySlice.length >= 2) {
-    const cosScores: number[] = []
-    for (let i = 1; i < stabilitySlice.length; i++) {
-      cosScores.push(Math.max(0, cosineSim(stabilitySlice[i].vec, stabilitySlice[i - 1].vec)))
+  // ── Metric 1: Feature variance stability ──────────────────────────────────
+  // Per-dimension std across last 5 V2 snapshots. High max-std = signals jumping = NOISY.
+  const varSlice = patternsV2.slice(-5)
+  let featureMaxStd = 0
+  if (varSlice.length >= 2) {
+    const dims = varSlice[0].vec.length
+    for (let d = 0; d < dims; d++) {
+      const vals = varSlice.map(p => p.vec[d])
+      const mean = vals.reduce((a, b) => a + b, 0) / vals.length
+      const std  = Math.sqrt(vals.reduce((s, v) => s + (v - mean) ** 2, 0) / vals.length)
+      if (std > featureMaxStd) featureMaxStd = std
     }
-    stabilityScore = cosScores.reduce((a, b) => a + b, 0) / cosScores.length
   }
+  // stabilityScore: 0 = max noise (std≥0.5), 1 = flat (std=0)
+  const stabilityScore = Math.max(0, 1 - featureMaxStd / 0.5)
   const stability: 'STABLE' | 'TRANSITIONING' | 'NOISY' =
-    stabilityScore > 0.80 ? 'STABLE' :
-    stabilityScore > 0.50 ? 'TRANSITIONING' : 'NOISY'
+    featureMaxStd < 0.15 ? 'STABLE' :
+    featureMaxStd < 0.35 ? 'TRANSITIONING' : 'NOISY'
 
-  // 2. cdZ trajectory — OLS slope of V2 vec[0] (cdZ) over last 12 snapshots
-  const cdZSlice = patternsV2.slice(-12).map(p => p.vec[0])
+  // ── Metric 2: cdVelZ rate-of-change ─────────────────────────────────────
+  // OLS slope on V2 vec[0] snapshots (1-min cadence = slow trend)
+  const cdZSlice  = patternsV2.slice(-12).map(p => p.vec[0])
   const cdVelSlope = _linSlope(cdZSlice)
   const cdVelTrend: 'RISING' | 'FLAT' | 'FALLING' =
-    cdVelSlope > 0.02 ? 'RISING' :
-    cdVelSlope < -0.02 ? 'FALLING' : 'FLAT'
+    cdVelSlope > 0.02 ? 'RISING' : cdVelSlope < -0.02 ? 'FALLING' : 'FLAT'
 
-  // 3. OBI/CD alignment from divergenceScore (fraction of snapshots where cdZ and OBI disagree)
-  // High divergence = hidden phase (Kyle accumulation/distribution) = early trend
-  // Low divergence  = visible phase (Stackelberg markup/markdown) = mid trend
-  const div = metaRegime?.divergenceScore ?? 0.5
+  // RoC from flowState cdZScore history (tick-level, faster signal)
+  // δcdZ = difference between mean of last 3 and mean of 3 before that
+  let cdVelRoC = 0
+  if (cdZHistory.length >= 6) {
+    const recent = cdZHistory.slice(-3).reduce((a, b) => a + b, 0) / 3
+    const prior  = cdZHistory.slice(-6, -3).reduce((a, b) => a + b, 0) / 3
+    cdVelRoC = recent - prior
+  }
+  const cdVelRoCLabel: 'ACCELERATING' | 'STEADY' | 'DECELERATING' =
+    cdVelRoC > 0.10 ? 'ACCELERATING' : cdVelRoC < -0.10 ? 'DECELERATING' : 'STEADY'
+
+  // ── Metric 3: OBI/CD rolling Pearson correlation ──────────────────────────
+  // Positive r: OBI and CD move together (visible/aligned = markup phase)
+  // Negative r: OBI and CD diverge (hidden = Kyle accumulation/distribution)
+  const pairs = obiCdPairs.slice(-20)
+  const obiCdCorr = pairs.length >= 5
+    ? _pearsonR(pairs.map(p => p.obi), pairs.map(p => p.cdZ))
+    : 0
   const obiCdAlignment: 'HIDDEN' | 'VISIBLE' | 'NEUTRAL' =
-    div > 0.35 ? 'HIDDEN' :
-    div < 0.20 ? 'VISIBLE' : 'NEUTRAL'
+    obiCdCorr < -0.25 ? 'HIDDEN' :   // OBI and CD moving opposite: institution hiding
+    obiCdCorr >  0.25 ? 'VISIBLE' :  // OBI and CD aligned: visible directional flow
+    'NEUTRAL'
 
-  // 4. Regime duration — scan backward through V2 to find when current regime started
+  // ── Metric 4: kNN prediction consistency ──────────────────────────────────
+  // Check if last 3 V2 queries agreed in direction AND magnitude
+  let knnConsistency: 'ALIGNED' | 'MIXED' | 'INSUFFICIENT' = 'INSUFFICIENT'
+  let knnConsistencyDetail = 'need 3 queries'
+  if (knnHistory.length >= 2) {
+    const dirs = knnHistory.map(h => h.direction)
+    const bullCount = dirs.filter(d => d === 'BULL').length
+    const bearCount = dirs.filter(d => d === 'BEAR').length
+    const n = dirs.length
+    if (n >= 3) {
+      if (bullCount === n || bearCount === n) {
+        knnConsistency = 'ALIGNED'
+        knnConsistencyDetail = `${n}/${n} ${bullCount === n ? 'BULL' : 'BEAR'}`
+      } else if (Math.max(bullCount, bearCount) >= n - 1) {
+        knnConsistency = 'MIXED'
+        knnConsistencyDetail = `${Math.max(bullCount, bearCount)}/${n} ${bullCount > bearCount ? 'BULL' : 'BEAR'}`
+      } else {
+        knnConsistency = 'MIXED'
+        knnConsistencyDetail = `split ${bullCount}B/${bearCount}Br`
+      }
+    } else {
+      // Only 2 queries
+      if (dirs[0] === dirs[1]) {
+        knnConsistency = 'ALIGNED'
+        knnConsistencyDetail = `2/2 ${dirs[0] ?? 'NEUTRAL'}`
+      } else {
+        knnConsistency = 'MIXED'
+        knnConsistencyDetail = '1/2 agree'
+      }
+    }
+  }
+
+  // ── Regime duration ───────────────────────────────────────────────────────
   let regimeDurationMin = 0
   if (metaRegime && patternsV2.length >= 2 && metaRegime.regime !== 'UNKNOWN') {
     const cdBull = metaRegime.avgCdZ > 0.15
@@ -1067,39 +1162,41 @@ export function computePhaseAnalysis(
     regimeDurationMin = startTs > 0 ? Math.round((Date.now() - startTs) / 60_000) : 0
   }
 
-  // 5. Phase scoring: START / MID / END
+  // ── Phase scoring ─────────────────────────────────────────────────────────
   let phase: 'START' | 'MID' | 'END' | 'UNKNOWN' = 'UNKNOWN'
   let phaseConfidence = 0
 
   const isChop = !metaRegime || metaRegime.regime === 'CHOP' || metaRegime.regime === 'UNKNOWN'
   if (patternsV2.length < 5 || isChop) {
-    phase = 'UNKNOWN'
-    phaseConfidence = 0
+    phase = 'UNKNOWN'; phaseConfidence = 0
   } else {
     let startScore = 0, midScore = 0, endScore = 0
 
-    // cdVelZ trajectory — most direct phase signal
-    if (cdVelTrend === 'RISING')  startScore += 2.5   // momentum just building
-    else if (cdVelTrend === 'FLAT') midScore += 2.0   // sustained
-    else endScore += 2.5                               // fading
+    // cdVelZ signals (both snapshot slope + real RoC)
+    if (cdVelTrend === 'RISING')         startScore += 2.0
+    else if (cdVelTrend === 'FLAT')      midScore   += 1.5
+    else                                 endScore   += 2.0
+    if (cdVelRoCLabel === 'ACCELERATING') startScore += 1.5
+    else if (cdVelRoCLabel === 'STEADY') midScore   += 1.0
+    else                                 endScore   += 1.5
 
-    // OBI/CD alignment (Kyle model phase)
-    if (obiCdAlignment === 'HIDDEN')       startScore += 2.0  // hidden = accumulation = early
-    else if (obiCdAlignment === 'VISIBLE') midScore   += 1.5  // visible = markup = mid
-    if (obiCdAlignment === 'VISIBLE' && cdVelTrend === 'FALLING') endScore += 1.0  // exhaustion
+    // OBI/CD correlation (Pearson, now properly computed)
+    if (obiCdAlignment === 'HIDDEN')     startScore += 2.0
+    else if (obiCdAlignment === 'VISIBLE') midScore += 1.5
+    if (obiCdAlignment === 'VISIBLE' && cdVelTrend === 'FALLING') endScore += 1.0
+
+    // kNN consistency
+    if (knnConsistency === 'ALIGNED')    midScore   += 1.0  // stable repeating signal = established
+    else if (knnConsistency === 'MIXED') startScore += 0.5  // inconsistent = transitional
 
     // Regime duration
-    if (regimeDurationMin < 8)       startScore += 1.5
-    else if (regimeDurationMin < 30) midScore   += 1.5
-    else                             endScore   += 2.0  // long-running = likely exhausting
+    if (regimeDurationMin < 8)           startScore += 1.5
+    else if (regimeDurationMin < 30)     midScore   += 1.5
+    else                                 endScore   += 2.0
 
     // Feature stability
-    if (stability === 'NOISY')   startScore += 0.5  // noisy = transitioning = start
-    if (stability === 'STABLE')  midScore   += 0.5
-
-    // Regime confidence
-    if (metaRegime.confidence < 0.3)      startScore += 0.5
-    else if (metaRegime.confidence > 0.6) midScore   += 0.5
+    if (stability === 'NOISY')           startScore += 0.5
+    if (stability === 'STABLE')          midScore   += 0.5
 
     const total = startScore + midScore + endScore
     if (total > 0) {
@@ -1112,11 +1209,12 @@ export function computePhaseAnalysis(
   }
 
   return {
-    phase, phaseConfidence, stability, stabilityScore,
-    cdVelTrend, cdVelSlope,
-    obiCdAlignment,
-    regimeDurationMin,
-    trendDirection,
+    phase, phaseConfidence,
+    stability, stabilityScore, featureMaxStd,
+    cdVelTrend, cdVelSlope, cdVelRoC, cdVelRoCLabel,
+    obiCdCorr, obiCdAlignment,
+    knnConsistency, knnConsistencyDetail,
+    regimeDurationMin, trendDirection,
   }
 }
 
@@ -2068,6 +2166,21 @@ export async function getNiftyFutState(): Promise<NiftyFutState> {
 
   const predV2 = queryAttentionV2(vecV2, ps.patternsV2[sessionKey])
 
+  // ── Populate history buffers for phase analysis ───────────────────────────
+  if (flowState) {
+    ps.cdZHistory.push(flowState.cdZScore)
+    if (ps.cdZHistory.length > 10) ps.cdZHistory = ps.cdZHistory.slice(-10)
+  }
+  if (predV2.direction !== undefined) {
+    ps.knnHistory.push({ direction: predV2.direction, bullProb: predV2.bullProb })
+    if (ps.knnHistory.length > 3) ps.knnHistory = ps.knnHistory.slice(-3)
+  }
+  if (depth && flowState) {
+    const df = computeDepthFeatures(depth)
+    ps.obiCdPairs.push({ obi: df.obi, cdZ: flowState.cdZScore })
+    if (ps.obiCdPairs.length > 30) ps.obiCdPairs = ps.obiCdPairs.slice(-30)
+  }
+
   if (now - ps.patternsV2LastPersistTs >= V2_PERSIST_INTERVAL_MS) {
     persistPatternsV2(ps)
   }
@@ -2213,7 +2326,7 @@ export async function getNiftyFutState(): Promise<NiftyFutState> {
     : null
 
   const phaseAnalysis = ps.patternsV2[sessionKey].length >= 5
-    ? computePhaseAnalysis(ps.patternsV2[sessionKey], metaRegime)
+    ? computePhaseAnalysis(ps.patternsV2[sessionKey], metaRegime, ps.cdZHistory, ps.knnHistory, ps.obiCdPairs)
     : null
 
   const otsState = computeOTSState({

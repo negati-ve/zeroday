@@ -49,11 +49,21 @@ interface MetaRegime {
 interface PhaseAnalysis {
   phase: 'START' | 'MID' | 'END' | 'UNKNOWN'
   phaseConfidence: number
+  // Metric 1: feature variance stability
   stability: 'STABLE' | 'TRANSITIONING' | 'NOISY'
   stabilityScore: number
+  featureMaxStd: number
+  // Metric 2: cdVelZ rate-of-change
   cdVelTrend: 'RISING' | 'FLAT' | 'FALLING'
   cdVelSlope: number
+  cdVelRoC: number
+  cdVelRoCLabel: 'ACCELERATING' | 'STEADY' | 'DECELERATING'
+  // Metric 3: OBI/CD Pearson correlation
+  obiCdCorr: number
   obiCdAlignment: 'HIDDEN' | 'VISIBLE' | 'NEUTRAL'
+  // Metric 4: kNN consistency
+  knnConsistency: 'ALIGNED' | 'MIXED' | 'INSUFFICIENT'
+  knnConsistencyDetail: string
   regimeDurationMin: number
   trendDirection: 'BULL' | 'BEAR' | null
 }
@@ -729,16 +739,16 @@ export default function N50FutConvictionClient({ role }: { role: string }) {
         const sb = stabilityBadge(pa.stability)
         const phaseInterpretation = pa.phase === 'START'
           ? (pa.obiCdAlignment === 'HIDDEN'
-            ? 'Kyle accumulation: CD diverging from book — institution in hidden phase. Early entry, expect expansion.'
-            : 'Momentum just building. cdVelZ rising. Enter with trend, tight stop.')
+            ? `Kyle accumulation: OBI/CD Pearson r=${pa.obiCdCorr.toFixed(2)} (diverging) — institution hiding. ${pa.knnConsistency === 'ALIGNED' ? 'kNN confirms direction.' : 'kNN still mixed — early.'} Early entry opportunity.`
+            : `Momentum just building (cdVelZ RoC ${pa.cdVelRoCLabel}). ${pa.knnConsistency === 'ALIGNED' ? pa.knnConsistencyDetail + ' kNN agreement.' : 'kNN mixed — wait for alignment.'} Enter with trend, tight stop.`)
           : pa.phase === 'MID'
           ? (pa.obiCdAlignment === 'VISIBLE'
-            ? 'Stackelberg markup: OBI aligned with CD — visible institutional flow. Ride with trend, trail stops.'
-            : 'Sustained regime, stable signals. Core position phase — stay in unless CD fades.')
+            ? `Stackelberg markup: r=${pa.obiCdCorr.toFixed(2)} OBI+CD aligned — visible flow. kNN: ${pa.knnConsistencyDetail}. Ride with trail stops.`
+            : `Sustained regime, stable signals (σ=${pa.featureMaxStd.toFixed(3)}). kNN: ${pa.knnConsistencyDetail}. Core phase — stay unless CD fades.`)
           : pa.phase === 'END'
-          ? (pa.cdVelTrend === 'FALLING'
-            ? 'CD momentum fading — regime exhausting. Consider target-and-exit, not adding.'
-            : `Long-running regime (${pa.regimeDurationMin}m). Reversal risk elevated. Tighten exits.`)
+          ? (pa.cdVelRoCLabel === 'DECELERATING'
+            ? `CD decelerating (δ=${pa.cdVelRoC.toFixed(2)}) — regime exhausting. kNN: ${pa.knnConsistencyDetail}. Target-and-exit.`
+            : `Long regime (${pa.regimeDurationMin}m). Reversal risk elevated. σ=${pa.featureMaxStd.toFixed(3)}. Tighten exits.`)
           : 'Insufficient data or CHOP — no phase signal.'
 
         return (
@@ -765,24 +775,37 @@ export default function N50FutConvictionClient({ role }: { role: string }) {
               )}
             </div>
 
-            {/* Signal grid */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '6px', fontSize: '11px', marginBottom: '8px' }}>
-              <div>
-                <span style={{ color: S.text2, fontSize: '9px' }}>STABILITY</span><br />
+            {/* Signal grid — 4 metrics */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '6px', fontSize: '11px', marginBottom: '8px' }}>
+              {/* Metric 1: Feature variance stability */}
+              <div style={{ padding: '5px 6px', background: 'rgba(255,255,255,0.03)', borderRadius: '4px' }}>
+                <span style={{ color: S.text2, fontSize: '9px', display: 'block', marginBottom: '2px' }}>① FEATURE STABILITY</span>
                 <span style={{ color: sb.color, fontWeight: 'bold' }}>{sb.label}</span>
-                <span style={{ color: S.text2, fontSize: '9px' }}> {(pa.stabilityScore * 100).toFixed(0)}%</span>
+                <span style={{ color: S.text2, fontSize: '9px' }}> σ={pa.featureMaxStd != null ? pa.featureMaxStd.toFixed(3) : '—'}</span>
               </div>
-              <div>
-                <span style={{ color: S.text2, fontSize: '9px' }}>cdVEL TREND</span><br />
-                <span style={{ color: pa.cdVelTrend === 'RISING' ? S.bull : pa.cdVelTrend === 'FALLING' ? S.bear : S.neutral, fontWeight: 'bold' }}>
-                  {trendArrow(pa.cdVelTrend)} {pa.cdVelTrend}
+              {/* Metric 2: cdVelZ rate-of-change */}
+              <div style={{ padding: '5px 6px', background: 'rgba(255,255,255,0.03)', borderRadius: '4px' }}>
+                <span style={{ color: S.text2, fontSize: '9px', display: 'block', marginBottom: '2px' }}>② cdVEL RoC</span>
+                <span style={{ color: pa.cdVelRoCLabel === 'ACCELERATING' ? S.bull : pa.cdVelRoCLabel === 'DECELERATING' ? S.bear : S.neutral, fontWeight: 'bold' }}>
+                  {pa.cdVelRoCLabel ?? pa.cdVelTrend}
                 </span>
+                <span style={{ color: S.text2, fontSize: '9px' }}> δ={(pa.cdVelRoC != null ? (pa.cdVelRoC >= 0 ? '+' : '') + pa.cdVelRoC.toFixed(2) : '—')}</span>
               </div>
-              <div>
-                <span style={{ color: S.text2, fontSize: '9px' }}>OBI·CD ALIGN</span><br />
+              {/* Metric 3: OBI/CD Pearson correlation */}
+              <div style={{ padding: '5px 6px', background: 'rgba(255,255,255,0.03)', borderRadius: '4px' }}>
+                <span style={{ color: S.text2, fontSize: '9px', display: 'block', marginBottom: '2px' }}>③ OBI·CD CORR</span>
                 <span style={{ color: pa.obiCdAlignment === 'HIDDEN' ? '#eab308' : pa.obiCdAlignment === 'VISIBLE' ? S.bull : S.text2, fontWeight: 'bold' }}>
                   {alignIcon(pa.obiCdAlignment)} {pa.obiCdAlignment}
                 </span>
+                <span style={{ color: S.text2, fontSize: '9px' }}> r={(pa.obiCdCorr != null ? (pa.obiCdCorr >= 0 ? '+' : '') + pa.obiCdCorr.toFixed(2) : '—')}</span>
+              </div>
+              {/* Metric 4: kNN prediction consistency */}
+              <div style={{ padding: '5px 6px', background: 'rgba(255,255,255,0.03)', borderRadius: '4px' }}>
+                <span style={{ color: S.text2, fontSize: '9px', display: 'block', marginBottom: '2px' }}>④ kNN CONSISTENCY</span>
+                <span style={{ color: pa.knnConsistency === 'ALIGNED' ? S.bull : pa.knnConsistency === 'MIXED' ? '#eab308' : S.text2, fontWeight: 'bold' }}>
+                  {pa.knnConsistency}
+                </span>
+                <span style={{ color: S.text2, fontSize: '9px' }}> {pa.knnConsistencyDetail ?? ''}</span>
               </div>
             </div>
 

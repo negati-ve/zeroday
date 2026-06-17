@@ -3739,7 +3739,7 @@ export default function ConvictionClient({ role = 'admin' }: { role?: string }) 
           <span style={{ fontSize: '11px', color: 'var(--accent)', letterSpacing: '0.05em', fontWeight: 700 }}>CONVICTION</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
-          {[{ href: '/dashboard', label: '📊' }, { href: '/dashboard/backtest', label: 'BT' }, { href: '/dashboard/conviction-crude', label: 'OIL' }, { href: '/dashboard/live', label: '◉' }].map(l => (
+          {[{ href: '/dashboard', label: '📊' }, { href: '/dashboard/backtest', label: 'BT' }, { href: '/dashboard/conviction-n50fut', label: 'N50 FUT ▶' }, { href: '/dashboard/conviction-crude', label: 'CRUDE ▶' }, { href: '/dashboard/live', label: '◉' }].map(l => (
             <a key={l.href} href={l.href} style={{ ...btnStyle, padding: '3px 6px', fontSize: '10px' }}>{l.label}</a>
           ))}
           <button onClick={() => setShowTgSettings(true)} style={{ ...btnStyle, cursor: 'pointer', padding: '3px 6px', fontSize: '10px' }} title="Telegram">TG</button>
