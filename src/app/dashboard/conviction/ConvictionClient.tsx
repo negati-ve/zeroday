@@ -2237,6 +2237,18 @@ function N50SysLog({ entries, at, onArm, onDisarm, restricted = false }: { entri
 
 function N50Oracle({ n50, role = 'admin' }: { n50: N50State | null; role?: string }) {
   const [showComponents, setShowComponents] = useState(true)
+  const [topSimHistory, setTopSimHistory] = useState<{ ts: number; sim: number; dir: 'BULL' | 'BEAR' | null }[]>([])
+  const lastTopSimTs = useRef(0)
+
+  const pred0 = n50?.prediction
+  useEffect(() => {
+    if (!pred0 || pred0.status !== 'ready') return
+    const now = Date.now()
+    if (now - lastTopSimTs.current < 12_000) return
+    lastTopSimTs.current = now
+    setTopSimHistory(h => [...h.slice(-19), { ts: now, sim: pred0.topSim, dir: pred0.direction }])
+  }, [pred0?.topSim, pred0?.direction, pred0?.status])
+
   if (!n50) return (
     <div style={{ padding: '12px', background: CYB.panel, border: `1px solid ${CYB.glowBorder}`, borderRadius: '6px' }}>
       <span style={{ fontSize: '10px', color: CYB.glow, opacity: 0.6 }}>{'> CONNECTING TO NEURAL NETWORK...'}</span>
@@ -2346,6 +2358,104 @@ function N50Oracle({ n50, role = 'admin' }: { n50: N50State | null; role?: strin
         </div>
       )}
 
+      {/* //SIGNAL QUALITY — 6 oracle readiness indicators */}
+      {pred.status === 'ready' && (() => {
+        const pa = n50.phaseAnalysis
+        const isTradeableSim   = pred.topSim >= 0.40
+        const isTradeableConf  = comp.confidence >= 0.25
+        const isTradeableStab  = !pa || pa.featureMaxStd < 0.50
+        const isTradeableMove  = Math.abs(pred.predictedMove) >= 0.15
+        const passCount = [isTradeableSim, isTradeableConf, isTradeableStab, isTradeableMove].filter(Boolean).length
+        const sqStatus  = passCount === 4 ? 'GO' : passCount >= 2 ? 'CAUTION' : 'NO'
+        const sqColor   = sqStatus === 'GO' ? '#4ecdc4' : sqStatus === 'CAUTION' ? '#ffd93d' : '#ff6b6b'
+        const sqBg      = sqStatus === 'GO' ? 'rgba(78,205,196,0.08)' : sqStatus === 'CAUTION' ? 'rgba(255,217,61,0.08)' : 'rgba(255,107,107,0.08)'
+
+        // Effective-N from topSim² heuristic (softmax concentrates mass near topSim)
+        const effectiveN = Math.max(1, Math.round(pred.nResolved * pred.topSim * pred.topSim * 4))
+
+        // Microstructure vs kNN divergence — "memory only" when most stocks are NEUTRAL but kNN is directional
+        const compScoreNeutral = (n50.bullStockPct + n50.bearStockPct) < 20
+        const knnDirectional   = pred.bullProb > 0.70 || pred.bearProb > 0.70
+        const memoryOnly       = compScoreNeutral && knnDirectional
+
+        // OBI vs CD divergence check
+        const obiDir = tech.avgImbalance > 0.08 ? 'BULL' : tech.avgImbalance < -0.08 ? 'BEAR' : null
+        const cdDir  = tech.avgCdZ > 0.3 ? 'BULL' : tech.avgCdZ < -0.3 ? 'BEAR' : null
+        const obiCdConflict = obiDir !== null && cdDir !== null && obiDir !== cdDir
+
+        // topSim sparkline
+        const simBars = topSimHistory.slice(-12)
+        const simBarH = 16
+        const simBarW = 8
+
+        return (
+          <div style={{ padding: '7px 9px', borderRadius: '4px', background: sqBg, border: `1px solid ${sqColor}30`, display: 'flex', flexDirection: 'column', gap: '5px' }}>
+            {/* Header: TRADEABLE status + checklist */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '7px', color: CYB.glow, letterSpacing: '0.15em', fontWeight: 700 }}>{'//SIGNAL QUALITY'}</span>
+              <span style={{
+                fontSize: '9px', fontWeight: 800, padding: '1px 8px', borderRadius: '3px',
+                background: sqColor + '22', border: `1px solid ${sqColor}60`, color: sqColor, letterSpacing: '0.12em',
+              }}>{sqStatus === 'GO' ? '✓ TRADEABLE' : sqStatus === 'CAUTION' ? '~ WEAK' : '✗ NOT TRADEABLE'}</span>
+              <span style={{ fontSize: '8px', color: 'var(--text3)', marginLeft: 'auto' }}>{passCount}/4 checks</span>
+            </div>
+
+            {/* 4 checklist items */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2px 12px', fontSize: '8px' }}>
+              {([
+                [isTradeableSim,  `sim ${pred.topSim.toFixed(2)}`, `need ≥0.40 · eff-n~${effectiveN}`],
+                [isTradeableConf, `conf ${(comp.confidence*100).toFixed(0)}%`, 'need ≥25%'],
+                [isTradeableStab, pa ? `σ ${pa.featureMaxStd.toFixed(2)}` : 'stab n/a', 'need σ<0.50'],
+                [isTradeableMove, `|Δ| ${Math.abs(pred.predictedMove).toFixed(3)}%`, 'need ≥0.15%'],
+              ] as [boolean,string,string][]).map(([pass, val, need]) => (
+                <div key={need} style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                  <span style={{ color: pass ? '#4ecdc4' : '#ff6b6b', fontWeight: 700, width: '10px' }}>{pass ? '✓' : '✗'}</span>
+                  <span style={{ color: pass ? 'var(--text2)' : 'var(--text3)', fontWeight: 600 }}>{val}</span>
+                  {!pass && <span style={{ color: 'var(--text3)', fontSize: '7px' }}>{need}</span>}
+                </div>
+              ))}
+            </div>
+
+            {/* topSim sparkline */}
+            {simBars.length >= 2 && (
+              <div style={{ display: 'flex', alignItems: 'flex-end', gap: '1px', marginTop: '1px' }}>
+                <span style={{ fontSize: '7px', color: 'var(--text3)', marginRight: '3px', lineHeight: '1', alignSelf: 'center' }}>sim</span>
+                {simBars.map((s, i) => {
+                  const h = Math.max(2, Math.round((s.sim / 1.0) * simBarH))
+                  const c = s.sim >= 0.40 ? '#4ecdc4' : s.sim >= 0.25 ? '#ffd93d' : '#ff6b6b'
+                  const dirMark = s.dir === 'BULL' ? '▲' : s.dir === 'BEAR' ? '▼' : '·'
+                  return (
+                    <div key={i} title={`sim=${s.sim.toFixed(2)} ${s.dir ?? 'NEUTRAL'}`} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1px' }}>
+                      <span style={{ fontSize: '5px', color: s.dir === 'BULL' ? 'var(--bull)' : s.dir === 'BEAR' ? 'var(--bear)' : 'var(--text3)', lineHeight: '1' }}>{dirMark}</span>
+                      <div style={{ width: `${simBarW}px`, height: `${h}px`, background: c, borderRadius: '1px', opacity: 0.7 + 0.3 * (i / simBars.length) }} />
+                      <span style={{ fontSize: '5px', color: 'var(--text3)', lineHeight: '1' }}>{s.sim.toFixed(2)}</span>
+                    </div>
+                  )
+                })}
+                <div style={{ width: '1px', height: `${Math.round(0.4 * simBarH)}px`, background: '#4ecdc4', opacity: 0.4, marginLeft: '2px', alignSelf: 'flex-end' }} title="0.40 threshold" />
+              </div>
+            )}
+
+            {/* Divergence warnings */}
+            {memoryOnly && (
+              <div style={{ fontSize: '8px', color: '#ffd93d', background: 'rgba(255,217,61,0.08)', borderRadius: '3px', padding: '2px 6px', borderLeft: '2px solid #ffd93d' }}>
+                ⚠ MEMORY ONLY — oracle from patterns, no live book signal (all {(n50.heavyweights?.length ?? 0) + (n50.midweights?.length ?? 0) + (n50.lowweights?.length ?? 0)} stocks NEUTRAL)
+              </div>
+            )}
+            {obiCdConflict && (
+              <div style={{ fontSize: '8px', color: '#fb923c', background: 'rgba(251,146,60,0.08)', borderRadius: '3px', padding: '2px 6px', borderLeft: '2px solid #fb923c' }}>
+                ⚡ OBI·CD CONFLICT — book={obiDir} cd={cdDir} · Kyle model: follow CD, not book
+              </div>
+            )}
+            {pa?.stabilityLabel === 'NOISY' && (
+              <div style={{ fontSize: '8px', color: '#f87171', background: 'rgba(248,113,113,0.07)', borderRadius: '3px', padding: '2px 6px', borderLeft: '2px solid #f87171' }}>
+                ✗ STATE UNSTABLE — σ={pa.featureMaxStd.toFixed(2)} · features unsettled, oracle unreliable until STABLE
+              </div>
+            )}
+          </div>
+        )
+      })()}
+
       {/* Component breakdown: Pattern KNN + Pat60_20 + Technicals */}
       <div style={{
         display: 'flex', flexDirection: 'column', gap: '3px',
@@ -2363,13 +2473,19 @@ function N50Oracle({ n50, role = 'admin' }: { n50: N50State | null; role?: strin
 
         {showComponents && <>
         {/* Pattern KNN (n50 300-dim attention) */}
-        <SignalRow
-          label="PAT·N50"
-          bullPct={patBull} bearPct={patBear}
-          move={pred.status === 'ready' ? pred.predictedMove : undefined}
-          detail={pred.status === 'ready' ? (role !== 'viewer' ? `sim ${pred.topSim.toFixed(2)} · n=${pred.nResolved}` : '') : pred.status}
-          dim={pred.status !== 'ready'}
-        />
+        {(() => {
+          const effN = pred.status === 'ready' ? Math.max(1, Math.round(pred.nResolved * pred.topSim * pred.topSim * 4)) : 0
+          const simWarn = pred.status === 'ready' && pred.topSim < 0.4
+          return (
+            <SignalRow
+              label="PAT·N50"
+              bullPct={patBull} bearPct={patBear}
+              move={pred.status === 'ready' ? pred.predictedMove : undefined}
+              detail={pred.status === 'ready' ? (role !== 'viewer' ? `sim ${pred.topSim.toFixed(2)}${simWarn ? '⚠' : ''} · n=${pred.nResolved} eff~${effN}` : '') : pred.status}
+              dim={pred.status !== 'ready'}
+            />
+          )
+        })()}
 
         {/* Pat60_20 aggregate (per-stock 60min→20min patterns) */}
         {tech.pat60_20 && (
@@ -2438,8 +2554,14 @@ function N50Oracle({ n50, role = 'admin' }: { n50: N50State | null; role?: strin
                 <span style={{ fontWeight: 700, color: CYB.glow, letterSpacing: '0.1em' }}>PHASE</span>
                 <span style={{ fontWeight: 700, color: phaseColor }}>{pa.phase}</span>
                 <span style={{ color: 'var(--text3)' }}>{(pa.confidence * 100).toFixed(0)}%</span>
-                <span style={{ color: stabColor }}>{pa.stabilityLabel}</span>
+                <span style={{ fontWeight: 600, color: stabColor }}>{pa.stabilityLabel}</span>
                 <span style={{ color: 'var(--text3)' }}>σ={pa.featureMaxStd.toFixed(3)}</span>
+                {pa.stabilityLabel === 'NOISY' && (
+                  <span style={{ fontSize: '7px', color: '#f87171', background: 'rgba(248,113,113,0.12)', borderRadius: '2px', padding: '0 3px' }}>oracle↓</span>
+                )}
+                {pa.stabilityLabel === 'STABLE' && (
+                  <span style={{ fontSize: '7px', color: '#4ecdc4', background: 'rgba(78,205,196,0.12)', borderRadius: '2px', padding: '0 3px' }}>oracle↑</span>
+                )}
               </div>
               {/* 4 metric detail row */}
               <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', paddingLeft: '56px', fontSize: '8px', color: 'var(--text3)' }}>
@@ -2458,6 +2580,12 @@ function N50Oracle({ n50, role = 'admin' }: { n50: N50State | null; role?: strin
                 <span>
                   kNN <span style={{ fontWeight: 600, color: knnColor }}>{pa.knnConsistencyDetail}</span>
                 </span>
+                {pa.obiCdPhase === 'HIDDEN' && (
+                  <span style={{ fontSize: '7px', color: '#fbbf24', background: 'rgba(251,191,36,0.1)', borderRadius: '2px', padding: '0 3px' }}>Kyle: institution hiding</span>
+                )}
+                {pa.obiCdPhase === 'VISIBLE' && (
+                  <span style={{ fontSize: '7px', color: '#34d399', background: 'rgba(52,211,153,0.1)', borderRadius: '2px', padding: '0 3px' }}>Stackelberg: markup visible</span>
+                )}
               </div>
             </>
           )
