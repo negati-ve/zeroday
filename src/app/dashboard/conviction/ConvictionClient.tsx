@@ -2325,12 +2325,25 @@ function N50Oracle({ n50, role = 'admin' }: { n50: N50State | null; role?: strin
               <span style={{ fontSize: '9px', fontWeight: 600, color: 'var(--bear)', width: '24px' }}>{compBear}</span>
             </div>
           </div>
-          <div style={{ display: 'flex', gap: '10px', fontSize: '8px', color: 'var(--text3)', paddingLeft: '56px', flexWrap: 'wrap' }}>
-            <span>conf <span style={{ color: 'var(--text2)', fontWeight: 600 }}>{(comp.confidence * 100).toFixed(0)}%</span></span>
-            <span>pat <span style={{ color: CYB.glow, fontWeight: 600 }}>{(comp.components.patternWeight * 100).toFixed(0)}%</span></span>
-            <span>tech <span style={{ color: CYB.glow, fontWeight: 600 }}>{(comp.components.techWeight * 100).toFixed(0)}%</span></span>
-            <span>proxy <span style={{ color: n50.niftyProxy >= 0 ? 'var(--bull)' : 'var(--bear)', fontWeight: 600 }}>{n50.niftyProxy >= 0 ? '+' : ''}{n50.niftyProxy.toFixed(3)}%</span></span>
-          </div>
+          {(() => {
+            const syslog = n50.sysLog ?? []
+            const resolved = syslog.filter(e => e.resolved && e.outcomeMove != null)
+            const correct = resolved.filter(e => (e.predMove > 0) === (e.outcomeMove! > 0))
+            const hitRate = resolved.length >= 3 ? correct.length / resolved.length : null
+            const confColor = comp.confidence >= 0.5 ? 'var(--bull)' : comp.confidence >= 0.25 ? '#ffd93d' : 'var(--text2)'
+            const hitColor = hitRate == null ? 'var(--text3)' : hitRate >= 0.65 ? 'var(--bull)' : hitRate >= 0.50 ? '#ffd93d' : 'var(--bear)'
+            return (
+              <div style={{ display: 'flex', gap: '10px', fontSize: '8px', color: 'var(--text3)', paddingLeft: '56px', flexWrap: 'wrap' }}>
+                <span>conf <span style={{ color: confColor, fontWeight: 600 }}>{(comp.confidence * 100).toFixed(0)}%</span></span>
+                {hitRate != null && (
+                  <span>acc <span style={{ color: hitColor, fontWeight: 600 }}>{Math.round(hitRate * 100)}%</span><span style={{ opacity: 0.6 }}> ({resolved.length})</span></span>
+                )}
+                <span>pat <span style={{ color: CYB.glow, fontWeight: 600 }}>{(comp.components.patternWeight * 100).toFixed(0)}%</span></span>
+                <span>tech <span style={{ color: CYB.glow, fontWeight: 600 }}>{(comp.components.techWeight * 100).toFixed(0)}%</span></span>
+                <span>proxy <span style={{ color: n50.niftyProxy >= 0 ? 'var(--bull)' : 'var(--bear)', fontWeight: 600 }}>{n50.niftyProxy >= 0 ? '+' : ''}{n50.niftyProxy.toFixed(3)}%</span></span>
+              </div>
+            )
+          })()}
         </div>
       ) : (
         <div style={{ fontSize: '10px', color: 'var(--text3)', padding: '4px 0' }}>

@@ -962,9 +962,13 @@ function computeComposite(
     ? (patternWeight * patMove + techWeight * techImpliedMove) / totalWeight
     : techImpliedMove
 
+  // conf: blend pattern confidence (now directional×sim) with tech alignment bonus.
+  // Tech term boosts conf when technicals agree with pattern direction (max +30%).
+  // When no pattern: tech-only confidence from how strongly stocks lean one way.
+  const techAlignment = Math.abs(techBullScore - 0.5) * 2  // 0=neutral, 1=all bull or all bear
   const conf = patternReady
-    ? prediction.confidence * (0.7 + 0.3 * Math.abs(techBullScore - 0.5) * 2)
-    : Math.abs(techBullScore - 0.5) * 2
+    ? prediction.confidence * (0.7 + 0.3 * techAlignment)
+    : techAlignment
 
   return {
     predictedMove: blendedMove,
@@ -1093,12 +1097,21 @@ function queryAttention(queryVec: number[]): N50Prediction {
   const bullProb = total > 0 ? bullWeight / total : 0.5
   const bearProb = 1 - bullProb
 
+  // confidence = directional strength × topSim reliability
+  // weights[0] was the old formula — it measures softmax peaked-ness (≈1/K when all sims low),
+  // not how clearly the vote points one way. At K=10 with low topSim it's stuck at ~0.10.
+  // New: |bearProb - bullProb| captures the vote unanimity; simReliability scales it by how
+  // familiar this state is (0 = never seen, 1 = very close historical match found).
+  const directionalStrength = Math.abs(bullProb - bearProb)        // 0=split 50/50, 1=unanimous
+  const simReliability = Math.min(1, topK[0].sim / 0.40)           // 0 at sim=0, 1.0 at sim≥0.40
+  const confidence = directionalStrength * simReliability
+
   return {
     predictedMove,
     bullProb,
     bearProb,
     topSim: topK[0].sim,
-    confidence: weights[0],
+    confidence,
     nResolved: resolved.length,
     direction: bullProb >= 0.55 ? 'BULL' : bearProb >= 0.55 ? 'BEAR' : null,
     status: 'ready',
