@@ -3,11 +3,8 @@ import { getSessionUser } from '@/lib/auth'
 import { getN50State, updateSysLog, type N50State } from '@/lib/nifty50'
 import { kiteGetLTP } from '@/lib/kite'
 import { getNiftyContracts, getCachedNiftyOI, type NiftyContracts, type NiftyOIAnalytics } from '@/lib/niftyContracts'
-import { processATTick, getATState, ensureATBackground } from '@/lib/autoTrader'
-import { processHeroTick, getHeroState, ensureHeroBackground, type HeroState } from '@/lib/optionHero'
-
-ensureATBackground()
-ensureHeroBackground()
+import { processATTick, getATState } from '@/lib/autoTrader'
+import { processHeroTick, getHeroState, type HeroState } from '@/lib/optionHero'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'

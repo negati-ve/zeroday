@@ -637,6 +637,12 @@ export function ensureHeroBackground() {
   setInterval(async () => {
     const s = getHeroState()
     if (!s.armed) return
+
+    // Skip outside market hours — avoids Kite API timeouts when exchange is closed
+    const { hour, minute } = getISTHourMin(Date.now())
+    const marketOpen = (hour > 9 || (hour === 9 && minute >= 15)) && (hour < 15 || (hour === 15 && minute <= 30))
+    if (!marketOpen && !s.position) return   // keep ticking if position is open (exit checks)
+
     try {
       const { kiteGetLTP: _ltp } = await import('./kite')
       const ltpData = await _ltp(['NSE:NIFTY 50'])
