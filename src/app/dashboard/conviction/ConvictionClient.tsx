@@ -2654,11 +2654,39 @@ function N50Oracle({ n50, role = 'admin' }: { n50: N50State | null; role?: strin
           )
         }
 
+        const allStocks = [...(n50.heavyweights ?? []), ...(n50.midweights ?? []), ...(n50.lowweights ?? [])]
+        const n50Summary = tierSummary(allStocks)
+        const n50Dir = n50Summary.dir
+        const n50Color = n50Dir === 'BULL' ? 'var(--bull)' : n50Dir === 'BEAR' ? 'var(--bear)' : 'var(--text2)'
+        const n50BgColor = n50Dir === 'BULL' ? 'rgba(34,197,94,0.07)' : n50Dir === 'BEAR' ? 'rgba(239,68,68,0.07)' : 'rgba(255,255,255,0.03)'
+        const n50BorderColor = n50Dir === 'BULL' ? 'rgba(34,197,94,0.35)' : n50Dir === 'BEAR' ? 'rgba(239,68,68,0.35)' : CYB.glowBorder
+        const bullCount = allStocks.filter(s => s.trend === 'BULL').length
+        const bearCount = allStocks.filter(s => s.trend === 'BEAR').length
+        const neutCount = allStocks.length - bullCount - bearCount
+
         return (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '0px' }}>
-            <WeightTierRow label="HEAVY" stocks={n50.heavyweights ?? []} chipSize={10} />
-            <WeightTierRow label="MID" stocks={n50.midweights ?? []} chipSize={9} />
-            <WeightTierRow label="LOW" stocks={n50.lowweights ?? []} chipSize={9} />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0px', border: `1px solid ${n50BorderColor}`, borderRadius: '6px', background: n50BgColor, overflow: 'hidden' }}>
+            {/* NIFTY 50 summary header */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '6px 10px', borderBottom: `1px solid ${n50BorderColor}` }}>
+              <span style={{ fontSize: '8px', color: CYB.glow, letterSpacing: '0.12em', fontWeight: 700 }}>NIFTY·50</span>
+              <span style={{ fontSize: '15px', fontWeight: 800, color: n50Color }}>
+                {n50Dir === 'BULL' ? '▲' : n50Dir === 'BEAR' ? '▼' : '·'} {n50Summary.bullPct}B / {n50Summary.bearPct}S
+              </span>
+              <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <span style={{ fontSize: '9px', fontWeight: 700, color: 'var(--bull)', width: '22px', textAlign: 'right' }}>{n50Summary.bullPct}</span>
+                <MiniBar bull={n50Summary.bullPct} bear={n50Summary.bearPct} height={6} />
+                <span style={{ fontSize: '9px', fontWeight: 700, color: 'var(--bear)', width: '22px' }}>{n50Summary.bearPct}</span>
+              </div>
+              <span style={{ fontSize: '8px', color: 'var(--text3)', marginLeft: 'auto' }}>
+                {bullCount}▲ {bearCount}▼ {neutCount}·
+              </span>
+            </div>
+            {/* Tier rows inside the wrapper */}
+            <div style={{ padding: '4px 6px', display: 'flex', flexDirection: 'column', gap: '0px' }}>
+              <WeightTierRow label="HEAVY" stocks={n50.heavyweights ?? []} chipSize={10} />
+              <WeightTierRow label="MID" stocks={n50.midweights ?? []} chipSize={9} />
+              <WeightTierRow label="LOW" stocks={n50.lowweights ?? []} chipSize={9} />
+            </div>
           </div>
         )
       })()}
